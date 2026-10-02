@@ -179,6 +179,23 @@ class FakeClient:
     async def health(self) -> dict[str, Any]:
         return self.health_payload
 
+    async def bot_connected(self) -> bool | None:
+        """Whether the bot's Minecraft connection is up, or ``None`` if unknown.
+
+        Derived from ``health_payload`` exactly as ``McpClient`` derives it, never
+        taken as a flag, so a test cannot make the loop believe something the real
+        client could not have told it. The real client ignores the status code -
+        ``src/server/http.ts:90`` answers ``503`` with ``ok: false`` when the bot
+        is disconnected, so a dead bot is a *readable* payload, not a failure.
+        An empty payload is ``None``, which is the case that matters: an
+        unreadable diagnosis is not a diagnosis.
+        """
+        minecraft = self.health_payload.get("minecraft")
+        if not isinstance(minecraft, dict):
+            return None
+        connected = minecraft.get("connected")
+        return connected if isinstance(connected, bool) else None
+
     async def list_tools(self) -> list[dict[str, Any]]:
         return [{"name": tool} for tool in self.script]
 

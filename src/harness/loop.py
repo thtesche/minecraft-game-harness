@@ -54,6 +54,15 @@ STOP_GOAL_ATTEMPTS = "goal_attempts_exhausted"
 #: the scenario asked, and counting that as progress would corrupt the very
 #: measurement the scenario exists to make.
 STOP_GOAL_UNKNOWN = "goal_unknown"
+#: The bot's Minecraft connection is closed. Named, and checked *before* the
+#: unverified-read retries, because retrying a socket the server has already said
+#: is closed cannot succeed and each attempt costs a round trip: mine-ai-mcp
+#: answers ``/health`` 503 with ``minecraft.connected: false``, and
+#: ``src/server/runtime-host.ts:143`` states that "a new Minecraft connection
+#: requires an explicit service restart". So there is nothing for the harness to
+#: wait for, and the report says who has to act rather than reporting a parse
+#: failure three attempts later.
+STOP_RUNTIME_UNAVAILABLE = "runtime_unavailable"
 
 #: Stop reasons that mean "the run did not finish its work", as opposed to
 #: finishing it. A plan that ran out is a success; a refusal is not.
@@ -67,6 +76,7 @@ INCOMPLETE_STOPS = frozenset(
         STOP_ERROR,
         STOP_GOAL_ATTEMPTS,
         STOP_GOAL_UNKNOWN,
+        STOP_RUNTIME_UNAVAILABLE,
     }
 )
 
@@ -176,8 +186,12 @@ class RunLoop:
         started = self.clock()
 
         for step in range(max_steps):
-            vector = await self._trusted_state(report)
+            vector, unavailable = await self._trusted_state(report)
             if vector is None:
+                if unavailable is not None:
+                    report.stop_reason = STOP_RUNTIME_UNAVAILABLE
+                    report.detail = unavailable
+                    return report
                 report.stop_reason = STOP_UNVERIFIED_STATE
                 report.detail = (
                     f"the world could not be read after "
@@ -212,22 +226,56 @@ class RunLoop:
         report.detail = f"reached the {max_steps}-step ceiling without exhausting the plan"
         return report
 
-    async def _trusted_state(self, report: LoopReport) -> StateVector | None:
-        """A state the decider may be shown, or ``None`` to end the run.
+    async def _runtime_unavailable(self) -> str | None:
+        """Why the world is unreadable, when the host will say so.
+
+        Returns a message when ``/health`` reports the bot's Minecraft connection
+        closed, and ``None`` otherwise - including when ``/health`` itself cannot
+        be read, because an unreadable diagnosis is not a diagnosis. That
+        asymmetry is the point: naming the cause is strictly better than reporting
+        a parse failure, and *guessing* the cause would be strictly worse than
+        either.
+        """
+        connected = await self.reader.client.bot_connected()
+        if connected is not False:
+            return None
+        return (
+            "the bot's Minecraft connection is closed; /health reports "
+            "minecraft.connected=false. mine-ai-mcp does not reconnect - "
+            "src/server/runtime-host.ts says a new connection requires an "
+            "explicit service restart, so this run cannot be recovered in place."
+        )
+
+    async def _trusted_state(
+        self, report: LoopReport
+    ) -> tuple[StateVector | None, str | None]:
+        """A state the decider may be shown, and why there is none.
 
         Re-reads rather than proceeding with a degraded vector: a fresh read is a
         fresh attempt, whereas carrying invented numbers forward is the exact
         failure this codebase refuses elsewhere. ``last_death_at`` is captured
         here as well because absorbing a death is a comparison across the step.
+
+        Returns ``(vector, None)`` on a usable state, ``(None, reason)`` when the
+        bot's connection is known to be closed, and ``(None, None)`` when the read
+        simply could not be made - which the caller must not confuse with the two.
         """
         for attempt in range(self.max_unverified_reads + 1):
             vector = await self.reader.read()
             if not vector.unverified:
-                return vector
+                return vector, None
             report.unverified_reads += 1
+            # Named on the *first* failure only. A closed socket cannot be read
+            # better by asking again, so once the cause is establishable there is
+            # nothing to gain from the remaining retries; but one bad read is not
+            # a dead bot, and calling it one would be a confident wrong answer.
+            if attempt == 0:
+                unavailable = await self._runtime_unavailable()
+                if unavailable is not None:
+                    return None, unavailable
             if attempt < self.max_unverified_reads:
                 self._record_unverified(vector, attempt)
-        return None
+        return None, None
 
     def _refuse_off_goal(self, proposal: Proposal) -> tuple[str, str] | None:
         """Refuse a proposal that names a goal this run cannot work on.

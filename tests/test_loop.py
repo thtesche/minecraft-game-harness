@@ -24,9 +24,11 @@ from harness.decide import (
 from harness.ledger import Ledger
 from harness.mcp_client import McpClient
 from harness.loop import (
+    INCOMPLETE_STOPS,
     STOP_ESCALATED,
     STOP_PLAN_EXHAUSTED,
     STOP_REFUSED,
+    STOP_RUNTIME_UNAVAILABLE,
     STOP_STEP_LIMIT,
     STOP_UNVERIFIED_STATE,
     RunLoop,
@@ -149,6 +151,81 @@ async def test_a_dropped_connection_is_ridden_out_by_the_re_read(ledger_config):
     assert report.stop_reason == STOP_PLAN_EXHAUSTED
     assert report.objectives_succeeded == 1
     assert report.unverified_reads == 1
+
+
+async def test_a_closed_minecraft_connection_is_named_rather_than_retried(ledger_config):
+    """`/health` says the socket is gone, so the run stops and says who must act.
+
+    Measured against a live host whose bot had dropped: the loop reported
+    `unverified_state` after three reads, which is true and useless - nobody can
+    fix a parse failure, but anybody can restart a service. The server's own
+    comment at `src/server/runtime-host.ts:143` says a new connection needs an
+    explicit restart, so the run cannot recover in place and should not pretend
+    to be trying.
+    """
+    client = FakeClient(
+        script={"view_status": [status_missing("mobility")]},
+        health_payload={"ok": False, "minecraft": {"connected": False}},
+    )
+    report = await build(client, ScriptedDecider([(TOOL, {})]), ledger_config).run()
+
+    assert report.stop_reason == STOP_RUNTIME_UNAVAILABLE
+    assert STOP_RUNTIME_UNAVAILABLE in INCOMPLETE_STOPS
+    assert not report.ok
+    assert "explicit service restart" in report.detail
+    assert "minecraft.connected=false" in report.detail
+    # One read, not three. A closed socket cannot be read better by asking again,
+    # and every extra attempt is a round trip spent discovering the same thing.
+    assert report.unverified_reads == 1
+    assert report.steps == []
+
+
+async def test_an_unreadable_health_never_becomes_a_diagnosis(ledger_config):
+    """An unreadable `/health` is not evidence the bot is gone.
+
+    The asymmetry is the whole point of naming a cause: naming it when it is
+    known beats reporting a parse failure, and *guessing* it would be worse than
+    either. So the fallback is the generic refusal, and the reason has to say so.
+    """
+    for payload in ({}, {"minecraft": None}, {"minecraft": {"connected": "yes"}},
+                    {"ok": False}):
+        client = FakeClient(
+            script={"view_status": [status_missing("mobility")]},
+            health_payload=payload,
+        )
+        report = await build(client, ScriptedDecider([(TOOL, {})]), ledger_config).run()
+        assert report.stop_reason == STOP_UNVERIFIED_STATE, payload
+        assert report.unverified_reads == 2, payload
+        assert report.steps == [], payload
+
+
+async def test_a_connected_bot_is_never_reported_as_a_dead_one(ledger_config):
+    """The refusal must not fire when the bot is demonstrably up.
+
+    Guards the check itself rather than the stop reason: a `/health` that says
+    `connected: true` while the read fails is a contract change, and the honest
+    answer is still `unverified_state` after the retries.
+    """
+    client = FakeClient(
+        script={"view_status": [status_missing("mobility")]},
+        health_payload={"ok": True, "minecraft": {"connected": True}},
+    )
+    report = await build(client, ScriptedDecider([(TOOL, {})]), ledger_config).run()
+    assert report.stop_reason == STOP_UNVERIFIED_STATE
+    assert report.unverified_reads == 2
+
+
+async def test_a_healthy_bot_never_asks_health_at_all(ledger_config):
+    """The extra read is paid only on a failure.
+
+    A `GET /health` on every state read would add a network round trip to the
+    hot path of the loop to serve a diagnosis that is only needed when something
+    has already gone wrong.
+    """
+    client = FakeClient(script={"view_status": [status()]})
+    await build(client, ScriptedDecider([]), ledger_config).run()
+    assert client.calls, "the state read must still have happened"
+    assert all(name == "view_status" for name, _ in client.calls)
 
 
 async def test_the_step_ceiling_stops_a_loop_that_never_exhausts_its_plan(ledger_config):

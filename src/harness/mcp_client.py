@@ -281,13 +281,49 @@ class McpClient:
 
         Not MCP: a plain GET. After a transport drop this is how we learn
         whether admitted work is still running.
+
+        The status code is deliberately **not** raised on. ``/health`` answers
+        ``503`` *by design* when the bot is disconnected and puts the reason in
+        the body - ``src/server/http.ts:90`` computes ``healthy`` from
+        ``minecraft.connected`` and returns 503 with ``ok: false`` when it is
+        false. Raising there would break the one command a person runs to find
+        out that the bot disconnected: measured, ``harness health`` died with an
+        ``HTTPStatusError`` traceback against a host whose only fault was that
+        the answer was bad news. The body is the answer; only an unreadable body
+        is an error.
         """
         import httpx2
 
         async with httpx2.AsyncClient(timeout=10.0) as client:
             response = await client.get(self.config.health())
-            response.raise_for_status()
-            return response.json()
+            try:
+                return response.json()
+            except ValueError as error:
+                raise ProtocolError(
+                    f"{self.config.health()} answered {response.status_code} with a "
+                    f"body that is not JSON: {response.text[:200]!r}"
+                ) from error
+
+    async def bot_connected(self) -> bool | None:
+        """Whether the bot's Minecraft connection is up, or ``None`` if unknown.
+
+        ``None`` rather than ``False``: an unreadable ``/health`` is not evidence
+        that the bot is gone, and a caller that cannot establish the cause must
+        fall back to the generic refusal rather than invent a specific one. This
+        is the read that lets the loop say *why* the world is unreadable instead
+        of retrying a socket that is already closed.
+        """
+        import httpx2
+
+        try:
+            health = await self.health()
+        except (HarnessError, httpx2.HTTPError, OSError, ValueError):
+            return None
+        minecraft = health.get("minecraft")
+        if not isinstance(minecraft, dict):
+            return None
+        connected = minecraft.get("connected")
+        return connected if isinstance(connected, bool) else None
 
 
 def _timeout(read_s: float):
