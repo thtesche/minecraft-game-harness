@@ -21,11 +21,22 @@ from typing import Any
 from .config import Config
 from .decide import ScriptedDecider
 from .errors import BudgetExceeded, HarnessError, ObjectiveFailed
+from .goals import GoalBoard, GoalError
 from .ledger import Ledger
 from .llm import LlmError, LlmUsage, OpenRouterDecider, load_dotenv
 from .loop import INCOMPLETE_STOPS, RunLoop, StepReport
 from .mcp_client import McpClient
 from .objective import Objective, ObjectiveRunner
+from .scenario import (
+    Scenario,
+    ScenarioError,
+    ScenarioReport,
+    WorldFacts,
+    format_report,
+    situation_of,
+    verdicts_for,
+    world_facts,
+)
 from .state import StateReader
 from . import sse
 
@@ -137,27 +148,10 @@ async def cmd_run_loop(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 64
     try:
-        script = json.loads(args.script)
-    except json.JSONDecodeError as error:
-        # Named rather than raised: a quote left out of a shell command is a typo,
-        # and a traceback sends the reader looking through the parser.
-        print(f"--script is not valid JSON: {error}", file=sys.stderr)
+        entries = _script_entries(args.script)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
         return 64
-    if not isinstance(script, list) or not all(isinstance(entry, dict) for entry in script):
-        print('script must be a JSON list of {"tool": ..., "arguments": {...}}', file=sys.stderr)
-        return 64
-
-    entries: list[tuple[str, dict[str, Any]]] = []
-    for entry in script:
-        tool = entry.get("tool")
-        if not isinstance(tool, str) or not tool:
-            print(f"script entry has no tool: {entry}", file=sys.stderr)
-            return 64
-        arguments = entry.get("arguments") or {}
-        if not isinstance(arguments, dict):
-            print(f"script arguments must be an object: {entry}", file=sys.stderr)
-            return 64
-        entries.append((tool, arguments))
 
     with Ledger(config.ledger, config.run_id) as ledger:
         async with McpClient(config.mcp) as client:
@@ -247,6 +241,163 @@ async def _run_loop_with_model(config: Config, args: argparse.Namespace) -> int:
     if report.stop_reason in INCOMPLETE_STOPS:
         print(f"run stopped: {report.detail or report.stop_reason}", file=sys.stderr)
     return 0 if report.ok else 1
+
+
+async def cmd_run_scenario(args: argparse.Namespace) -> int:
+    """Run a scenario and grade it against its own checkers.
+
+    The Phase 2 measurement path. ``run-loop`` answers "did the sequence run";
+    this answers "did the run achieve the thing, within the call budget, with
+    evidence", which is the only form in which two deciders can be compared.
+
+    The post-run world read is a separate read rather than the loop's last state,
+    for a reason worth stating: the loop's vector is deliberately lossy to keep
+    the prompt small - twelve stacks, counts discarded past that - so a checker
+    reading it would report "no pickaxe" for a bot holding one in slot twenty.
+    """
+    config = _config(args)
+    try:
+        scenario = Scenario.load(args.scenario)
+    except (ScenarioError, GoalError) as error:
+        print(str(error), file=sys.stderr)
+        return 64
+
+    entries: list[tuple[str, dict[str, Any]]] = []
+    if args.decider == "script":
+        if not args.script:
+            print(
+                "run-scenario --decider script needs --script; use --decider llm to "
+                "let a model choose each objective",
+                file=sys.stderr,
+            )
+            return 64
+        try:
+            entries = _script_entries(args.script)
+        except ValueError as error:
+            print(str(error), file=sys.stderr)
+            return 64
+    else:
+        code = _check_llm_prereqs(config)
+        if code:
+            return code
+
+    board = GoalBoard.of(scenario.goals, max_attempts=config.budget.max_attempts_per_goal)
+
+    with Ledger(config.ledger, config.run_id) as ledger:
+        async with McpClient(config.mcp) as client:
+            tools = await client.list_tools()
+            if args.decider == "llm":
+                try:
+                    decider: Any = OpenRouterDecider(config.llm, tools)
+                except LlmError as error:
+                    print(str(error), file=sys.stderr)
+                    return 78
+            else:
+                decider = ScriptedDecider(entries, tools)
+
+            print(f"scenario: {scenario.name}", file=sys.stderr)
+            print(f"goals: {', '.join(goal.label() for goal in scenario.goals)}", file=sys.stderr)
+            print(f"checks: {', '.join(check.kind for check in scenario.checks)}", file=sys.stderr)
+            if scenario.prompt:
+                print(f"prompt: {scenario.prompt}", file=sys.stderr)
+
+            loop = RunLoop(
+                StateReader(client),
+                ObjectiveRunner(client, config.mcp, config.budget, ledger),
+                decider,
+                ledger=ledger,
+                submission_prefix=config.mcp.submission_prefix or f"{config.run_id}-",
+                on_step=_print_step,
+                goals=board,
+            )
+            report = await loop.run(max_steps=scenario.max_steps)
+            facts = await _world_facts(client)
+
+    result = ScenarioReport(
+        name=scenario.name,
+        loop=report,
+        verdicts=verdicts_for(scenario, report, facts),
+        usage=_usage_summary(getattr(decider, "calls", [])),
+        run_id=config.run_id,
+        reference=scenario.reference,
+    )
+    print(json.dumps(result.summary(), indent=2))
+    print(format_report(result), file=sys.stderr)
+    if report.stop_reason in INCOMPLETE_STOPS:
+        print(f"run stopped: {report.detail or report.stop_reason}", file=sys.stderr)
+    # 0 only when the run finished cleanly *and* every check passed, so a
+    # scenario suite can be run unattended and a red check is a red exit code.
+    return 0 if result.passed else 1
+
+
+def _check_llm_prereqs(config: Config) -> int:
+    """Refuse a model run that cannot happen, before the world is touched."""
+    load_dotenv()
+    if not config.llm.model:
+        print(
+            "llm.model is empty; set it in the config to an OpenRouter model id. "
+            "An empty model would be sent as a request with no model in it.",
+            file=sys.stderr,
+        )
+        return 78
+    if not os.environ.get(config.llm.api_key_env):
+        print(
+            f"{config.llm.api_key_env} is not set. Copy .env.example to .env, put "
+            f"the key in it, and export it; the key is read from the environment.",
+            file=sys.stderr,
+        )
+        return 78
+    return 0
+
+
+def _script_entries(raw: str) -> list[tuple[str, dict[str, Any]]]:
+    """Parse a script, refusing malformed input by name.
+
+    Raises :class:`ValueError` rather than ``SystemExit`` so both callers report
+    it the same way; the message names the problem, because a quote left out of
+    a shell command is a typo and a traceback sends the reader looking through
+    the JSON parser.
+    """
+    try:
+        script = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"--script is not valid JSON: {error}") from error
+    if not isinstance(script, list) or not all(isinstance(entry, dict) for entry in script):
+        raise ValueError('--script must be a JSON list of {"tool": ..., "arguments": {...}}')
+
+    entries: list[tuple[str, dict[str, Any]]] = []
+    for entry in script:
+        tool = entry.get("tool")
+        if not isinstance(tool, str) or not tool:
+            raise ValueError(f"script entry has no tool: {entry}")
+        arguments = entry.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            raise ValueError(f"script arguments must be an object: {entry}")
+        entries.append((tool, arguments))
+    return entries
+
+
+async def _world_facts(client: McpClient) -> WorldFacts | None:
+    """Read the world for the checkers, or ``None`` when it cannot be read.
+
+    ``None`` rather than empty facts on purpose: a checker has to be able to tell
+    "the bot holds nothing" from "the harness could not look", and only the second
+    is allowed to make a check fail.
+    """
+    try:
+        reply = await client.call("view_status", {}, rationale="Scenario checker: read the world")
+    except HarnessError as error:
+        print(f"scenario check read failed: {error}", file=sys.stderr)
+        return None
+    situation = situation_of(reply)
+    if situation is None:
+        print(
+            "scenario check read carried no situation in either reply shape: "
+            f"{sorted(reply.data)}",
+            file=sys.stderr,
+        )
+        return None
+    return world_facts(situation)
 
 
 def _usage_summary(calls: list[LlmUsage]) -> dict[str, Any] | None:
@@ -356,6 +507,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="ceiling on loop passes, independent of the script length",
     )
     run_loop.set_defaults(handler=cmd_run_loop)
+
+    run_scenario = sub.add_parser(
+        "run-scenario",
+        help="run a scenario file's goals and grade them against its checkers",
+    )
+    run_scenario.add_argument("scenario", help="path to a scenario JSON file")
+    run_scenario.add_argument(
+        "--decider",
+        choices=("script", "llm"),
+        default="llm",
+        help="script replays --script; llm asks llm.model on every decision",
+    )
+    run_scenario.add_argument(
+        "--script",
+        help='JSON list of {"tool": ..., "arguments": {...}}, only with --decider script',
+    )
+    run_scenario.set_defaults(handler=cmd_run_scenario)
 
     ledger = sub.add_parser("ledger", help="inspect recorded decisions")
     ledger.add_argument("--limit", type=int, default=20)

@@ -178,22 +178,26 @@ def test_a_refusal_has_no_result_object():
 
 
 def test_the_state_reader_reads_a_situation_from_either_shape():
-    from harness.state import _situation
+    # Public since the scenario checker needs the *same* parse. A checker that
+    # walked the payload itself could disagree with the state reader about where
+    # the situation lives, and that disagreement would look exactly like "the
+    # bot did not get a pickaxe".
+    from harness.state import situation_of
 
-    assert _situation(direct_reply()) == {"vitals": {}}
+    assert situation_of(direct_reply()) == {"vitals": {}}
     nested = ToolReply(
         is_error=False,
         data={"state": "settled", "output": {"result": {"situation": {"vitals": {"health": 20}}}}},
         notifications={},
     )
-    assert _situation(nested) == {"vitals": {"health": 20}}
+    assert situation_of(nested) == {"vitals": {"health": 20}}
 
 
 def test_no_situation_in_either_place_is_none_not_an_empty_world():
-    from harness.state import _situation
+    from harness.state import situation_of
 
-    assert _situation(direct_reply(result={"status": "succeeded"})) is None
-    assert _situation(envelope_reply()) is None
+    assert situation_of(direct_reply(result={"status": "succeeded"})) is None
+    assert situation_of(envelope_reply()) is None
 
 
 def test_a_third_reply_shape_is_refused_at_parse_time():

@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol, Sequence, runtime_checkable
 
+from .goals import GoalBoard
 from .mcp_client import argument_names
 from .state import StateVector
 
@@ -42,6 +43,12 @@ class Proposal:
     #: Recorded so a later reader can tell a scripted row from a model row without
     #: consulting the code that produced it.
     source: str = "unknown"
+    #: Which goal this objective is pursuing, when the run has goals at all. A
+    #: registry item name from the goal set (D18). It is recorded on the ledger
+    #: row and it is what ``budget.max_attempts_per_goal`` is counted against, so
+    #: "calls per goal" becomes a number rather than something a reader infers
+    #: from the arguments.
+    goal: str | None = None
 
 
 @dataclass(frozen=True)
@@ -60,7 +67,14 @@ class Decider(Protocol):
     ``step`` is the 0-based index of this decision within the run, passed so a
     model that needs to know how much of its plan is left can know it, rather
     than reading the remaining budget out of a vector field that does not exist.
+
+    ``goals`` is the run's :class:`~harness.goals.GoalBoard`, or ``None`` when
+    the run has no goals. It is passed rather than read from the vector because
+    a goal set is a fact about the *run*, not about the world: the same world
+    read twice belongs to two different runs aiming at two different things, and
+    folding the goal into the state would make those two runs share a cache key.
     """
+    goals: GoalBoard | None
 
     async def propose(
         self,
@@ -132,6 +146,9 @@ class ScriptedDecider:
         self._tools = {str(tool.get("name")): tool for tool in tools}
         self._rationales = list(rationales)
         self._index = 0
+        #: Set by the loop before each decision. A script names no goal, so this
+        #: stays ``None`` unless a caller wires it deliberately.
+        self.goals: GoalBoard | None = None
 
     @property
     def remaining(self) -> int:

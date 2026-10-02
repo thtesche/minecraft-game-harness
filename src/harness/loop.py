@@ -30,6 +30,7 @@ from typing import Any, Callable
 
 from .decide import Decider, Escalation, Proposal
 from .errors import BudgetExceeded, HarnessError, ObjectiveFailed
+from .goals import GoalBoard
 from .ledger import DecisionRow, Ledger
 from .objective import Objective, ObjectiveResult, ObjectiveRunner, SeenState
 from .state import StateReader, StateVector
@@ -43,11 +44,30 @@ STOP_UNVERIFIED_STATE = "unverified_state"
 STOP_REFUSED = "refused"
 STOP_BUDGET = "budget"
 STOP_ERROR = "error"
+#: The decider asked for a goal past ``budget.max_attempts_per_goal``. Named
+#: because the alternative - running it anyway - spends a real objective, and on
+#: the model path a real decision, on something the harness has already declared
+#: it will stop doing.
+STOP_GOAL_ATTEMPTS = "goal_attempts_exhausted"
+#: The decider named a goal that is not in the run's goal set. A refusal rather
+#: than a re-read: it means the decider is answering a different question than
+#: the scenario asked, and counting that as progress would corrupt the very
+#: measurement the scenario exists to make.
+STOP_GOAL_UNKNOWN = "goal_unknown"
 
 #: Stop reasons that mean "the run did not finish its work", as opposed to
 #: finishing it. A plan that ran out is a success; a refusal is not.
 INCOMPLETE_STOPS = frozenset(
-    {STOP_STEP_LIMIT, STOP_ESCALATED, STOP_UNVERIFIED_STATE, STOP_REFUSED, STOP_BUDGET, STOP_ERROR}
+    {
+        STOP_STEP_LIMIT,
+        STOP_ESCALATED,
+        STOP_UNVERIFIED_STATE,
+        STOP_REFUSED,
+        STOP_BUDGET,
+        STOP_ERROR,
+        STOP_GOAL_ATTEMPTS,
+        STOP_GOAL_UNKNOWN,
+    }
 )
 
 
@@ -61,6 +81,8 @@ class StepReport:
     result: ObjectiveResult | None = None
     death_cause: str | None = None
     error: str | None = None
+    #: The goal this objective served, when the run had goals.
+    goal: str | None = None
 
 
 @dataclass
@@ -75,6 +97,10 @@ class LoopReport:
     deaths_absorbed: int = 0
     #: Re-reads spent on a state that would not verify.
     unverified_reads: int = 0
+    #: Attempts made at each goal, when the run had goals. The per-goal
+    #: counterpart of ``steps``, and what makes "calls per goal" readable off a
+    #: report instead of inferred from arguments.
+    goal_attempts: dict[str, int] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -89,7 +115,7 @@ class LoopReport:
         return sum(1 for step in self.steps if step.result is not None and step.result.evidence_ok)
 
     def summary(self) -> dict[str, Any]:
-        return {
+        summary = {
             "stopReason": self.stop_reason,
             "detail": self.detail,
             "steps": len(self.steps),
@@ -98,6 +124,9 @@ class LoopReport:
             "deathsAbsorbed": self.deaths_absorbed,
             "unverifiedReads": self.unverified_reads,
         }
+        if self.goal_attempts:
+            summary["goalAttempts"] = dict(self.goal_attempts)
+        return summary
 
 
 class RunLoop:
@@ -123,6 +152,11 @@ class RunLoop:
         #: retried through a long run.
         max_unverified_reads: int = 1,
         on_step: Callable[[StepReport], None] | None = None,
+        #: The run's goal board, or ``None`` for a run with no goals. Owned here
+        #: rather than by the decider because the loop is what learns the outcome:
+        #: progress is recorded from what the server returned, never from what the
+        #: model intended.
+        goals: GoalBoard | None = None,
     ) -> None:
         self.reader = reader
         self.runner = runner
@@ -132,6 +166,10 @@ class RunLoop:
         self.submission_prefix = submission_prefix
         self.max_unverified_reads = max_unverified_reads
         self.on_step = on_step
+        self.goals = goals
+        #: Handed over rather than read by the decider from somewhere else, so a
+        #: decider that ignores it is visibly ignoring it.
+        self.decider.goals = goals
 
     async def run(self, *, max_steps: int = 32) -> LoopReport:
         report = LoopReport()
@@ -160,6 +198,10 @@ class RunLoop:
                 return report
 
             assert isinstance(answer, Proposal)
+            refused = self._refuse_off_goal(answer)
+            if refused is not None:
+                report.stop_reason, report.detail = refused
+                return report
             outcome = await self._run_one(answer, vector, step, report)
             if outcome is not None:
                 # A non-None return means the run must stop; the reason is already
@@ -187,6 +229,48 @@ class RunLoop:
                 self._record_unverified(vector, attempt)
         return None
 
+    def _refuse_off_goal(self, proposal: Proposal) -> tuple[str, str] | None:
+        """Refuse a proposal that names a goal this run cannot work on.
+
+        Two refusals, both named, both stopping the run rather than quietly
+        dropping the objective:
+
+        * a goal outside the set - the decider is answering a different question
+          than the scenario asked, and recording that as progress would corrupt
+          the measurement the scenario exists to make;
+        * a goal past ``max_attempts_per_goal`` - the harness has already declared
+          it will stop trying, and running it anyway spends a real objective on
+          the model path, which is 20-37 s per decision.
+
+        Both return ``None`` when the run has no goals, which is the ``run-loop``
+        path and must be unaffected by any of this.
+        """
+        if self.goals is None or not self.goals.enabled:
+            return None
+        goal = proposal.goal
+        if goal is None:
+            # A run with goals wants to know what each objective was for. A
+            # proposal that does not say cannot be counted, and silently counting
+            # it as unattributed work is how "calls per goal" becomes a guess.
+            return (
+                STOP_GOAL_UNKNOWN,
+                f"step {proposal.tool!r} named no goal, and this run has "
+                f"{len(self.goals.items)} goal(s); calls per goal cannot be measured "
+                "without knowing which goal each objective served",
+            )
+        if not self.goals.known(goal):
+            return (
+                STOP_GOAL_UNKNOWN,
+                f"{goal!r} is not in this run's goal set {list(self.goals.items)}",
+            )
+        if self.goals.exhausted(goal):
+            return (
+                STOP_GOAL_ATTEMPTS,
+                f"{goal!r} has had {self.goals.attempts.get(goal, 0)} attempt(s) against "
+                f"budget.max_attempts_per_goal={self.goals.max_attempts}",
+            )
+        return None
+
     async def _run_one(
         self,
         proposal: Proposal,
@@ -201,7 +285,11 @@ class RunLoop:
             arguments=proposal.arguments,
             rationale=proposal.rationale,
             submission_id=f"{self.submission_prefix}{uuid.uuid4().hex}",
-            metadata={"source": proposal.source, "confidence": proposal.confidence},
+            metadata={
+                "source": proposal.source,
+                "confidence": proposal.confidence,
+                "goal": proposal.goal,
+            },
         )
         seen = SeenState(vector=vector.to_dict(), state_hash=vector.state_hash)
         entry = StepReport(index=step, tool=proposal.tool, state_hash=vector.state_hash)
@@ -210,6 +298,10 @@ class RunLoop:
             result = await self.runner.run(objective, seen=seen)
         except ObjectiveFailed as error:
             entry.error = str(error)
+            # Credited on the way out too: a refused submission still spent an
+            # objective, and a report that counted only the successes would
+            # understate the cost of the run by however many were refused.
+            self._credit_abandoned(proposal.goal, entry, report, f"refused: {error}")
             report.steps.append(entry)
             self._emit(entry)
             report.stop_reason = STOP_REFUSED
@@ -238,9 +330,47 @@ class RunLoop:
             entry.death_cause = death
             report.deaths_absorbed += 1
 
+        self._credit_goal(proposal.goal, result, entry, report)
+
         report.steps.append(entry)
         self._emit(entry)
         return None
+
+    def _credit_goal(
+        self,
+        goal: str | None,
+        result: ObjectiveResult,
+        entry: StepReport,
+        report: LoopReport,
+    ) -> None:
+        """Bank one attempt against the goal this objective served.
+
+        Recorded from the settled result, not from the proposal: an objective
+        that failed is still an attempt, and only a success credits the goal. The
+        cap is on *attempts*, deliberately - a recipe may legitimately need many
+        steps without any of them being a search, and counting only failures would
+        let a decider retry forever as long as each try failed differently.
+        """
+        if goal is None or self.goals is None:
+            return
+        outcome = f"{result.state}:{result.status}" if result.status else result.state
+        self.goals.record(goal, ok=result.ok, outcome=outcome)
+        report.goal_attempts[goal] = self.goals.attempts.get(goal, 0)
+        entry.goal = goal
+
+    def _credit_abandoned(
+        self,
+        goal: str | None,
+        entry: StepReport,
+        report: LoopReport,
+        outcome: str,
+    ) -> None:
+        """Bank an attempt for an objective that raised instead of settling."""
+        if goal is None or self.goals is None:
+            return
+        self.goals.record(goal, ok=False, outcome=outcome)
+        report.goal_attempts[goal] = self.goals.attempts.get(goal, 0)
+        entry.goal = goal
 
     async def _absorb_death(
         self, death_before: str | None, result: ObjectiveResult

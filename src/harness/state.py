@@ -82,7 +82,16 @@ class StateVector:
     last_death_at: str | None = None
     last_death_cause: str | None = None
 
-    #: Why the state is not trustworthy, if it is not.
+    #: Why the state is not trustworthy, if it is not. Non-empty makes
+    #: :attr:`trustworthy` false, which is why an unrankable equipment tier is
+    #: recorded here rather than merely noted: this vector is what a decision is
+    #: made from, and a decider that cannot rank what it is holding should be
+    #: told so. Note that
+    #: :class:`~harness.scenario.WorldFacts` splits the same idea in two - its
+    #: ``unverified`` is only a section the harness could not parse, and an
+    #: unrankable tier is a *warning* there, because a checker asked "is this at
+    #: least stone" can still answer yes. Deliberate: a prompt is better served
+    #: by pessimism than a verdict by pessimism.
     unverified: list[str] = field(default_factory=list)
 
     @property
@@ -224,7 +233,7 @@ class StateReader:
                 unverified=[f"view_status failed: {reply.data.get('error')}"]
             )
 
-        situation = _situation(reply)
+        situation = situation_of(reply)
         if situation is None:
             return StateVector(
                 unverified=[
@@ -260,8 +269,8 @@ class StateReader:
 
         tools = _section(situation, "tools")
         if isinstance(tools, dict):
-            vector.best_tool, unranked = _best_item(tools.get("tools"), TOOL_TIER_ORDER)
-            vector.best_armour, unranked_armour = _best_item(
+            vector.best_tool, _, unranked = _best_item(tools.get("tools"), TOOL_TIER_ORDER)
+            vector.best_armour, _, unranked_armour = _best_item(
                 tools.get("armour"), ARMOUR_TIER_ORDER
             )
             vector.unverified.extend(unranked + unranked_armour)
@@ -354,8 +363,13 @@ class StateReader:
         return {"unverified": False, "output": result}
 
 
-def _situation(reply: ToolReply) -> dict[str, Any] | None:
+def situation_of(reply: ToolReply) -> dict[str, Any] | None:
     """The situation object, from whichever reply shape the server used.
+
+    Public because the scenario checker needs the *same* parse and not a second
+    one. A checker that walked the payload itself would be free to disagree with
+    the state reader about where the situation lives, and a disagreement there is
+    indistinguishable from "the bot did not get a pickaxe".
 
     ``view_status`` answers directly - ``data.result.situation`` - while an
     enveloped tool of the same name would nest it at
@@ -418,7 +432,9 @@ def _round(value: Any, digits: int = 1) -> float | None:
     return _number(value, digits)
 
 
-def _best_item(entries: Any, order: tuple[str, ...]) -> tuple[str | None, list[str]]:
+def _best_item(
+    entries: Any, order: tuple[str, ...]
+) -> tuple[str | None, str | None, list[str]]:
     """Best item held, from the server's one-row-per-class tool table.
 
     ``situation.tools`` is ``{"tools": [...], "armour": [...]}`` with one entry
@@ -427,14 +443,14 @@ def _best_item(entries: Any, order: tuple[str, ...]) -> tuple[str | None, list[s
     ``tier: "none"`` and ``item: null``. So an absent answer is a fact about the
     world (nothing held) and not a missing read.
 
-    Returns the item name and the tiers that could not be ranked. A row whose
-    tier this function does not know is reported rather than assumed, because
-    ranking it wrongly would report the wrong best tool with total confidence.
+    Returns ``(item, tier, unranked)``. A row whose tier this function does not
+    know is reported rather than assumed, because ranking it wrongly would report
+    the wrong best tool with total confidence.
     """
     if not isinstance(entries, list):
-        return None, []
+        return None, None, []
 
-    best: tuple[int, str] | None = None
+    best: tuple[int, str, str] | None = None
     unranked: list[str] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -450,5 +466,21 @@ def _best_item(entries: Any, order: tuple[str, ...]) -> tuple[str | None, list[s
             continue
         rank = order.index(tier)
         if best is None or rank > best[0]:
-            best = (rank, item)
-    return (best[1] if best else None), unranked
+            best = (rank, item, tier)
+    return (best[1] if best else None, best[2] if best else None, unranked)
+
+
+def best_equipment(situation: dict[str, Any], key: str) -> tuple[str | None, str | None, list[str]]:
+    """Best item and tier held in one of the two tables, from a situation.
+
+    Public because the scenario checker ranks equipment the same way the prompt
+    does. A checker with its own ranking could disagree with the state reader
+    about which tool is best, and that disagreement would be indistinguishable
+    from the bot not holding the tool at all. Keyed by ``"tools"`` or
+    ``"armour"``, each with its own tier order.
+    """
+    tools = _section(situation, "tools")
+    if not isinstance(tools, dict):
+        return None, None, []
+    order = ARMOUR_TIER_ORDER if key == "armour" else TOOL_TIER_ORDER
+    return _best_item(tools.get(key), order)

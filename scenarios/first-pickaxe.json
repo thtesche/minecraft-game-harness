@@ -1,0 +1,26 @@
+{
+  "name": "first-pickaxe",
+  "prompt": "Start with nothing and end holding a wooden pickaxe.",
+  "goals": [
+    "wooden_pickaxe"
+  ],
+  "checks": [
+    { "kind": "holds_item", "item": "wooden_pickaxe" },
+    { "kind": "goal_succeeded" },
+    { "kind": "evidence_verified" },
+    { "kind": "within_calls", "calls": 8 }
+  ],
+  "maxSteps": 16,
+  "reference": {
+    "source": "aibengineering/beat-the-game-minecraft (claude-opus-5[1m], effort high)",
+    "toolCalls": 4,
+    "objectiveSubmissions": 2,
+    "what": [
+      "view_status",
+      "note_read {n: 20}",
+      "collect_block {block_name: logs, count: 16}",
+      "craft_item [crafting_table, wooden_pickaxe, wooden_axe, stick x8]"
+    ],
+    "note": "4 tool calls, of which 2 were reads. This harness reads state itself and does not spend a submission on it, so the like-for-like number is the 2 objective submissions, not the 4 calls. The budget of 8 is deliberately not 2: a free model asked once to name the right block would be a coin flip rather than a measurement."
+  }
+}

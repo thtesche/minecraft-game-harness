@@ -47,6 +47,7 @@ import httpx
 from .config import LlmConfig
 from .decide import Proposal
 from .errors import HarnessError
+from .goals import GoalBoard
 from .mcp_client import argument_names, input_schema_of
 from .state import StateVector
 
@@ -139,11 +140,22 @@ merely to end the run early.
 the state as it then is.
 - Prefer a concrete objective you can act on over a plan. If the next step is \
 not one of these tools, choose the nearest tool that makes progress toward it.
+- Name the tool's arguments exactly as the schema spells them, and use the \
+generic block and item names the tools accept ("logs", "stone") rather than a \
+species name the tool may not recognise.
+
+If a "goals" list is present, every objective must name the one goal it \
+serves in "goal", and the run is measured by calls per goal - so an objective \
+that serves no listed goal is work the run will refuse. Each goal carries how \
+many attempts it has already had; a goal marked exhausted is one the harness \
+will refuse, so work on another. A goal is a target item, not a procedure: \
+`craft_item` resolves the recipe tree itself and tells you what leaves are \
+missing, so name the item you want rather than the steps to reach it.
 
 Answer in exactly this shape, with the reason in "rationale" and only the \
 tool's own arguments in "arguments":
 
-    {"done": false, "tool": "collect_block", "arguments": {"block_name": "oak_log"}, "rationale": "no logs held, and logs are the first step to a pickaxe"}
+    {"goal": "wooden_pickaxe", "done": false, "tool": "collect_block", "arguments": {"block_name": "logs"}, "rationale": "no logs held, and logs are the first step to a pickaxe"}
 
 A wrong answer here is worse than a slow one: an argument name the tool does \
 not advertise is dropped by the server, so the objective runs against the \
@@ -234,6 +246,7 @@ class LlmDecision:
     arguments: dict[str, Any] = field(default_factory=dict)
     rationale: str = ""
     done: bool = False
+    goal: str | None = None
     usage: LlmUsage = field(default_factory=LlmUsage)
 
 
@@ -379,6 +392,9 @@ class OpenRouterDecider:
         self._backoff_s = backoff_s
         #: Every call made, so a run can be measured after the fact.
         self.calls: list[LlmUsage] = []
+        #: Set by the loop. ``None`` for a run with no goals, in which case the
+        #: prompt omits them and the answer is not asked for a goal.
+        self.goals: GoalBoard | None = None
 
     @property
     def choices(self) -> list[str]:
@@ -408,6 +424,23 @@ class OpenRouterDecider:
         return list(self._stale_read_controls)
 
     async def propose(self, vector: StateVector, *, step: int) -> Proposal | None:
+        goals = self.goals
+        enabled = goals is not None and goals.enabled
+        schema = dict(_DECISION_SCHEMA["schema"])
+        if enabled:
+            # An enum, so a hallucinated goal is unrepresentable rather than
+            # caught afterwards - the same reasoning as the tool enum below. The
+            # prompt carries `goals.view()` from the same board, so the enum and
+            # the prompt cannot describe different sets.
+            schema["properties"] = {
+                **schema["properties"],
+                "goal": {
+                    "type": "string",
+                    "enum": list(goals.items),
+                    "description": "The goal this objective serves.",
+                },
+            }
+            schema["required"] = [*schema["required"], "goal"]
         payload = {
             "model": self._config.model,
             "messages": [
@@ -416,6 +449,7 @@ class OpenRouterDecider:
                     "role": "user",
                     "content": json.dumps({
                         "step": step,
+                        **({"goals": goals.view()} if enabled else {}),
                         "state": vector.to_dict(),
                         "tools": self._catalogue,
                     }, indent=2),
@@ -432,9 +466,9 @@ class OpenRouterDecider:
                     # constraint was silently ignored.
                     "strict": True,
                     "schema": {
-                        **_DECISION_SCHEMA["schema"],
+                        **schema,
                         "properties": {
-                            **_DECISION_SCHEMA["schema"]["properties"],
+                            **schema["properties"],
                             "tool": {
                                 "type": "string",
                                 "enum": sorted(self._tools),
@@ -458,6 +492,7 @@ class OpenRouterDecider:
             # docstring: this is the deliberate difference from a Laya decider.
             confidence=None,
             source=f"{self.source}:{decision.usage.model or self._config.model}",
+            goal=decision.goal,
         )
 
     def _parse(self, response: dict[str, Any]) -> LlmDecision:
@@ -517,10 +552,36 @@ class OpenRouterDecider:
                 f"model chose {tool!r}, which is not an advertised objective tool; "
                 f"it may choose from {sorted(self._tools)}"
             )
+        goal = self._checked_goal(body.get("goal"))
         self._check_arguments(tool, arguments)
         return LlmDecision(tool=tool, arguments=arguments,
                            rationale=str(body.get("rationale") or ""),
-                           usage=self._usage(response))
+                           goal=goal, usage=self._usage(response))
+
+    def _checked_goal(self, value: Any) -> str | None:
+        """The goal this objective serves, or ``None`` for a run without goals.
+
+        Refused here rather than left to the loop, because the loop's refusal
+        stops the whole run: a model that names a goal nobody asked for is
+        answering a different question, and the cheapest place to notice is where
+        the answer arrives.
+        """
+        goals = self.goals
+        if goals is None or not goals.enabled:
+            return None
+        if not isinstance(value, str) or not value:
+            raise LlmError(
+                f"this run has goals {list(goals.items)} and every decision must name "
+                "one in `goal`; the run is measured by calls per goal, so an unnamed "
+                "objective cannot be counted. It came back as "
+                f"{type(value).__name__} {value!r}"
+            )
+        if not goals.known(value):
+            raise LlmError(
+                f"model named goal {value!r}, which is not in this run's goal set "
+                f"{list(goals.items)}"
+            )
+        return value
 
     def _check_arguments(self, tool: str, arguments: dict[str, Any]) -> None:
         """Refuse arguments the advertised schema does not accept.

@@ -139,11 +139,17 @@ class ObjectiveRunner:
         )
 
         if seen is not None:
+            goal = objective.metadata.get("goal")
             row.question = {
                 "kind": "objective",
                 "tool": objective.tool,
                 "rationale": objective.rationale,
                 "source": objective.metadata.get("source", "unknown"),
+                # Under `question` rather than as its own column because the goal
+                # is the answer's *subject* - what the decider was trying to
+                # achieve with this tool - and a new column would be a schema
+                # change for every reader before any run has produced one.
+                **({"goal": goal} if isinstance(goal, str) else {}),
             }
             row.options = list(objective.metadata.get("options", ()))
             row.answer = objective.tool

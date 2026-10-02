@@ -69,10 +69,15 @@ Produces the decision state from the server's durable records. It reads, in orde
    refreshed tables plus chunk records for world-scale facts the bot cannot see
    from where it stands.
 3. **Cheap deterministic calls, before any model is consulted** (D7):
-   - `view_crafting_requirements` for goal decomposition — the server already walks
-     the recipe tree and names missing leaves
    - `view_frontier` for unexplored-chunk distance and bearing
    - the `mobility` verdict from `view_status` for what the current inventory permits
+
+**Not `view_crafting_requirements`.** It was planned here as the goal-decomposition
+step and has been removed on measurement (D18): the reference run called it **zero**
+times in 388 calls and instead asked `craft_item` for the items it wanted, reading the
+recipe tree, the leaf materials and the workstation requirement out of the *craft
+reply*. A harness that plans first pays for information the answer already carries. A
+goal is an item name, and the server does the decomposition.
 
 A view failure is **not** a default value. It is an unverified read that escalates
 (D-recall from ai-minebot §8.9.3: a parser that stops matching must fail the
@@ -267,7 +272,7 @@ bot 209 → 393 blocks over six runs with no way back.
 | `laya.min_confidence` | **fitted in Phase 3** | No default until the eval exists (D3) |
 | `llm.model` | — | Frontier model, escalation only |
 | `budget.objective_ms` | set per objective | Time budget |
-| `budget.max_attempts_per_goal` | set per objective | Per-goal ceiling |
+| `budget.max_attempts_per_goal` | `12` | Per-goal ceiling. **Read** by `RunLoop` against the goal each objective names; a proposal past the cap stops the run as `goal_attempts_exhausted` |
 
 ## 6. Build order
 
@@ -295,6 +300,18 @@ layer on top of it; if Phase 1 is skipped, nothing else has anything to sit on.
 
 Run the scenario set with the LLM node on every decision. Record LLM calls per
 objective, success rate, wall clock, and objective failure distribution.
+
+A scenario is `scenarios/*.json`: a name, an **unordered goal list**, and a **checker**.
+The checker is written before the run (D19) and is named code from
+`harness.scenario.CHECKS`, not prose. A scenario with no checks is refused at load
+time, and an unknown check kind is refused too — a scenario that cannot fail is
+indistinguishable from one that passed. The checkers read the world themselves, from
+a fresh `view_status` after the loop, because the loop's own vector is deliberately
+lossy (twelve stacks) and a checker reading a lossy view reports "no pickaxe" for a
+bot holding one in slot twenty.
+
+`run-scenario scenarios/first-pickaxe.json --decider llm` exits **0 only when every
+check passed and the loop finished cleanly**, so a suite can be run unattended.
 
 **Exit:** a baseline number exists, measured on a named scenario set. This is the
 comparison that makes "dramatically fewer LLM calls" falsifiable.
