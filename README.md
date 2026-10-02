@@ -5,10 +5,12 @@ A standalone application that plays Minecraft through
 [Laya](https://nandhakishorm.github.io/laya/) gating the decisions so that a frontier
 LLM is called far less often.
 
-> **Status: Phase 0 complete, verified live.** The skeleton connects, reads state, runs
-> one objective end to end, and records a ledger row — against a real Minecraft 1.21.4
-> world, not only a stand-in. That run found five defects the whole suite had passed; see
-> [Running it](#running-it) and [Roadmap](#roadmap).
+> **Status: Phase 1 slice one, verified live.** The skeleton connects, reads state, runs
+> one objective end to end, and records a ledger row. On top of that now sits the decision
+> loop: several objectives in sequence, one trusted state read before each, every ledger
+> row carrying the state its decision was made against. Verified against a real Minecraft
+> 1.21.4 world, not only a stand-in — the live legs found five defects the whole suite had
+> passed. See [Running it](#running-it) and [Roadmap](#roadmap).
 
 ## The problem
 
@@ -66,7 +68,7 @@ proceed — that is the difference between a measurement and an assumption.
 | Phase | Deliverable | Exit criterion | State |
 |---|---|---|---|
 | 0 — Skeleton | Connect, read status, run one objective, write a ledger row | One objective completes unattended, one ledger row exists | **done, live-verified** |
-| 1 — Runner | The submit → wait → retrieve protocol state machine | A scripted multi-objective run, every row with verified evidence | protocol core in `objective.py`; loop not built |
+| 1 — Runner | The submit → wait → retrieve protocol state machine, then a loop over them | A scripted multi-objective run, every row with verified evidence | **slice one done**; a real decider, cancellation and reconnection remain |
 | 2 — Baseline | LLM on every decision, on a named scenario set | A measured calls-per-objective number | next |
 | 3 — Eval gate | ≥ 200 labelled decisions, `laya-evals`, temperature refit | A documented planner/gatekeeper/fine-tune decision | |
 | 4 — Gated loop | Laya wired in at the decision point | Fewer LLM calls per objective, success rate not regressed | |
@@ -74,6 +76,48 @@ proceed — that is the difference between a measurement and an assumption.
 
 Phase 1 is the harness proper. Everything after it is an optimisation layer on top;
 without it there is nothing for a model to sit on.
+
+### The loop
+
+Each step reads the world, asks a decider what to do, runs it, and records what came of
+it. **The loop is deterministic; the decider is not.** Every protocol rule lives in code,
+and the model is consulted only for *which* objective to submit — so swapping a model in
+changes one module and nothing else, and the loop is testable with no model in it at all.
+
+Three things stop it, and each is recorded with the state that caused it:
+
+| | |
+|---|---|
+| `plan_exhausted` | The decider had nothing left. A finished plan, not a failure — the only exit that returns zero. |
+| `escalated` | The decider declined to answer. `min_confidence` is unset, so the honest answer is to escalate, and with no model to escalate *to* the run stops. Downgrading an escalation into a guess is the exact failure the threshold exists to prevent. |
+| `unverified_state` | The world would not verify. Re-read once, then stop: deciding from invented numbers is worse than not deciding. A re-read is a fresh attempt, not a guess. |
+
+A death is deliberately not one of them. The bot respawns and the remaining objectives
+are still answerable, so the loop absorbs the death, records it against the objective it
+interrupted, and continues. It costs one extra state read, and only after an objective
+that did *not* succeed — death cannot make a succeeded objective not have succeeded.
+
+`SUBMISSION_CONFLICT` has **no** recovery, on purpose. The refusal names no action, so
+the earlier submission holding that id cannot be found from it and that work may still be
+running. The only defence is making the collision impossible; `mcp.submission_prefix` is
+for attribution, so an id seen twice is identifiable as ours.
+
+### `state_hash`
+
+Every ledger row now carries the state its decision was made against. `state_hash` is
+that state's identity and the key the Phase 4 `Memo` cache is built on, which is why it
+was left unwired in Phase 0 rather than half-wired: nothing computed it then.
+
+It is **quantised**, and that is the design decision rather than a detail. Hashed
+verbatim it never repeats — two reads a second apart differ in position — so a cache keyed
+on it would record one hit in a thousand rows and be indistinguishable from a model
+ignoring it. Vitals bin to a whole point, position to half a chunk, distances to a block;
+discrete facts (what is carried, which tier is best, whether the bot has died) hash
+exactly.
+
+The claim it makes is deliberately weaker than "equal". Two states with the same hash are
+identical *in every respect a decision could turn on* — which is the property a cache
+needs, and a stronger claim than this can honestly make.
 
 ## Running it
 
@@ -84,8 +128,16 @@ cp config.example.json harness.config.json   # then point mcp.url at your host
 harness health                              # /health plus the published tool count
 harness state                               # the derived decision vector
 harness run-one collect_block --arguments '{"block_name": "dirt"}'
+harness run-loop --script '[{"tool":"collect_block","arguments":{"block_name":"dirt","count":2}}]'
 harness ledger --counts
 ```
+
+`harness run-loop` runs its objectives in order, printing one line per step on stderr
+and the run summary on stdout. A real objective takes minutes, so a loop that reports
+only at exit is indistinguishable from a hung process. The `--script` is the
+`ScriptedDecider` standing in for a model; every row it writes is marked
+`source: "scripted"` with a null confidence, so a scripted run is never mistaken for a
+model run.
 
 Start mine-ai-mcp first; `harness health` is the check that the host is reachable.
 
@@ -108,10 +160,16 @@ result directly (`{action, durationMs, result, survival, survivalPolicy}`, no `s
 an empty world as fact, so `ToolReply` resolves the result from either and insists on the
 envelope only where the protocol is required.
 
-The live host also advertises its 37 tools in a single 2.91 MiB server-sent event, which
-is over httpx2's 1 MiB ceiling — the SDK offers no way to raise it, and the resulting
-error reports itself as a dead socket. `src/harness/sse.py` is the one module that reaches
-into the SDK to bound it, and `harness health` reports whether that patch is in effect.
+The live host advertised its 37 tools in a single 2.91 MiB server-sent event, which is
+over httpx2's 1 MiB ceiling — the SDK offers no way to raise it, and the resulting error
+reports itself as a dead socket. `src/harness/sse.py` is the one module that reaches into
+the SDK to bound it, and `harness health` reports whether that patch is in effect.
+
+That ceiling was the correct client-side stopgap but treated only the symptom: Zod's
+`toJSONSchema` defaults to inlining a reused schema, so `wait_for_action` carried its
+394 KB foreground-output union twice and every checkpoint action's request variant was
+copied inline. Fixed at the source in `mine-ai-mcp` (`a27d93a`) by naming the schemas —
+3,054,268 → 2,485,102 bytes, `wait_for_action` 913 KB → 444 KB.
 
 ### Tests
 

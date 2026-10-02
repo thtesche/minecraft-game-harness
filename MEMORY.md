@@ -24,18 +24,27 @@ transcript rows):
 
 ## Current state
 
-Phase 0 is **live-verified** at `0d4bca7`. 78 tests pass, working tree clean.
+Phase 1 slice one is **live-verified** at `35302ae`. 109 tests pass, working tree
+clean.
 
 ```
 $ .venv/bin/python -m pytest -q
-78 passed in 3.82s
+109 passed in 3.84s
 ```
 
 Against a real Minecraft 1.21.4 host: `health` → 37 tools · `state` →
-trustworthy, `unverified: []` · `run-one collect_block` → `settled:succeeded`,
-`evidenceOk: true`, `polls: 16`, 41.6 s · `ledger` → `settled:succeeded` with a
-unique row id. The 41.6 s was spent waiting out a survival reflex that held the
-body — see D9.
+trustworthy, `unverified: []` · `run-loop` with two objectives → both
+sequenced, `plan_exhausted`, exit 0:
+
+```
+[0] collect_block: settled:succeeded evidence=ok 3.5s
+[1] collect_block: failed:failed       evidence=ok 0.0s
+```
+
+Both ledger rows carry a **unique** `state_hash`, `source: scripted`,
+`confidence: null`, and the full vector. The hashes differ because the
+inventory did, which is the evidence that the bins are not so coarse that
+distinct states collapse together.
 
 `mcp` SDK is **2.2.0**. Python 3.12 in `.venv` (uv-managed).
 
@@ -48,6 +57,15 @@ envelope and `tools` as `{"best": {...}}` — the two shapes the real host does
 `harness state` was broken live in two independent ways. A fake that encodes what
 the code under test happens to believe amplifies exactly the bug it exists to
 catch.
+
+**A second one, from mine-ai-mcp:** `tools/list` was 3,054,268 bytes because
+Zod's `toJSONSchema` defaults `reused` to `"inline"` — a shared schema used in
+two places is written out twice. `wait_for_action` referenced the foreground
+output union from *both* its `settled` and `storage_failed` branches (394 KB
+twice), and every checkpoint action's request variant was anonymous (one 22 KB
+block inlined eight times). Fixed in mine-ai-mcp at `a27d93a` by naming the
+schemas — `3,054,268 → 2,485,102`, `wait_for_action 913,523 → 444,049`. The
+client-side ceiling was correct as a stopgap but treated only the symptom.
 
 Five defects surfaced only against the live world; all five passed the suite:
 
@@ -75,7 +93,20 @@ Five defects surfaced only against the live world; all five passed the suite:
   Minecraft's own material order and reports anything outside it.
 - **Free body** = `activity.owner == "idle"` *and* `activeAction is null`
   (`action-runner.ts`). Owners: `idle | foreground | yielding | takeover`.
-- `tools/list` = 3,054,268 bytes. `wait_for_action` outputSchema alone = 913 KB.
+- `tools/list` = 3,054,268 bytes → **2,485,102** after mine-ai-mcp `a27d93a`.
+  `wait_for_action` outputSchema 913 KB → 444 KB.
+- **`lastDeath`** is a top-level `situation` key, present only after a death:
+  `{dimension, position, observedAt, cause}`. Absent on a fresh world, and
+  **not** a missing section — requiring it would report every new session
+  unverified. The live bot died twice this session (Zombie 12:30:36, Skeleton
+  14:28:19).
+- **Remaining advertisement bloat** is not inlining. 38% of what is left
+  (1,016,964 B) is four identical shared definitions repeated into 36 of 37
+  tool schemas — `MineAiSurvivalPolicySnapshot` alone is 533,880 B. `$defs`
+  cannot span documents, and each tool's schema is its own document.
+  `wait_for_action` also republishes a union each of the 27 foreground tools
+  already advertises verbatim. Getting under 1 MiB means removing published
+  information — an API decision for that repo's owner, not a mechanical fix.
 
 ## Ground rules for this repo
 
@@ -113,6 +144,11 @@ contracts. Full reasoning in `docs/harness_idea.md` §5.
 | D8 | The long submit→wait→retrieve protocol stays a deterministic loop. The model is consulted at decision points *inside* it. |
 | D9 | `ACTION_BUSY` **with no `activeActionId`** is a survival reflex holding the body. Wait it out via `view_status`, bounded by `budget.gate_wait_ms`. Treating it as terminal aborted every objective for as long as a mob lived — most of the night. A status read that cannot be parsed is **not** read as freedom: that submits into a reflex and reports the refusal as an answer. |
 | D10 | `harness.sse` is the single sanctioned place that reaches into the SDK. A ceiling default chosen below a *measured* workload is a silent outage, so `MCMEASURED_TOOLS_LIST_BYTES` is a constant and the default is asserted above it in a test. |
+| D11 | **The loop is deterministic; the decider is not.** Every protocol rule lives in code and the model is consulted only for *which* objective to submit. Swapping a model in changes `decide.py` and nothing else. |
+| D12 | **An escalation stops the run.** `min_confidence` is unset, so per `LayaConfig`'s own docstring the honest answer is "escalate rather than guess" — and with no model to escalate *to*, downgrading it into a guess is the exact failure the threshold exists to prevent. An escalation is recorded as a full row, because it is an answer. |
+| D13 | **`state_hash` is quantised, and the claim it makes is deliberately weak.** Hashed verbatim it never repeats — two reads a second apart differ in position — so a Memo cache keyed on it records one hit in a thousand rows and is indistinguishable from a model ignoring it. Vitals bin to a whole point, position to half a chunk, distances to a block; discrete facts hash exactly. Two states with the same hash are identical *in every respect a decision could turn on*, which is the property a cache needs and a stronger claim than this can honestly make. |
+| D14 | **A death is not a stop condition.** The bot respawns and remaining objectives are still answerable, so the loop absorbs it, records it against the objective it interrupted, and continues. It costs one extra state read, and only after an objective that did *not* succeed — death cannot make a succeeded objective not have succeeded. |
+| D15 | **`SUBMISSION_CONFLICT` has no recovery, on purpose.** The refusal names no action, so the earlier submission holding that id cannot be found from it, and that work may still be running. The only defence is making the collision impossible; `mcp.submission_prefix` is for attribution, so an id seen twice is identifiable as ours. |
 
 ## Laya operating limits
 
@@ -150,8 +186,10 @@ is exactly why they are code rather than prompt text.
 | `src/harness/objective.py` | The protocol state machine. |
 | `src/harness/state.py` | `view_status` → compact decision vector. Missing sections land in `unverified`, never as zeros. |
 | `src/harness/ledger.py` | JSONL + SQLite, one row per decision, flushed per row. |
+| `src/harness/loop.py` | The deterministic loop: read a trusted state, ask the decider, run, record. Three stop conditions (plan exhausted / escalated / unreadable); a death is not one. |
+| `src/harness/decide.py` | The model seam. `Proposal | Escalation | None` — three answers, and the third is the one that gets forgotten. `ScriptedDecider` is the Phase 1 stand-in and marks every row `source: "scripted"`. |
 | `src/harness/errors.py` | `UnverifiedRead` / `ProtocolError` / `ObjectiveFailed` / `BudgetExceeded`. |
-| `src/harness/cli.py` | `health`, `state`, `run-one`, `ledger`. |
+| `src/harness/cli.py` | `health`, `state`, `run-one`, `run-loop`, `ledger`. |
 | `src/harness/sse.py` | The **only** module that patches the SDK. Raises if the SDK's call site moves; distinguishes "raise the ceiling" from "the patch stopped working". |
 
 `ToolReply` is deliberately **shape-aware**: `is_protocol`, `state` (which may be
@@ -198,6 +236,10 @@ exact failure this project measures around. There is a test pinning this.
 ## Tests
 
 - `tests/test_objective.py`, `test_state.py`, `test_config.py` — unit, scripted client
+- `tests/test_loop.py` — the loop and the decider seam. Weighted towards what the loop
+  *refuses*: an unreadable state is re-read once then the run ends, an escalation is
+  never re-asked until it becomes a guess, a death is not a stop condition, the same
+  death timestamp is not counted twice
 - `tests/fake_host.py` — a real MCP server over Streamable HTTP reimplementing the
   submission protocol from the contract
 - `tests/test_live_client.py` — the real client against that stand-in
@@ -205,49 +247,59 @@ exact failure this project measures around. There is a test pinning this.
 The stand-in reproduces the **transport and protocol only**. It reports no physical
 world outcome that a test then believes. It is not Minecraft.
 
+`mine-ai-mcp` gained `src/server/advertised-size.test.ts` for the same reason: the
+advertisement bloat regresses *silently* — no tool changes behaviour, the payload just
+grows. It asserts the size relationship directly rather than re-deriving it from the
+code, and asserts that an unnamed union is **still** inlined per use, so if that ever
+stops holding, the measurement the fix was justified by is known to be stale rather
+than quietly assumed.
+
 ## Verified this session
 
 Live, against Minecraft 1.21.4 with the bot joined as `MineAI`: `health` → 37
-tools, SSE patch live · `state` → trustworthy, `unverified: []` · `run-one
-collect_block` → `settled:succeeded`, `evidenceOk: true`, `polls: 16` · `ledger`
-→ `settled:succeeded`, unique row ids.
+tools, SSE patch live · `state` → trustworthy, `unverified: []` · `run-loop` (two
+objectives) → both sequenced, `plan_exhausted`, exit 0 · `ledger` → two rows with
+unique `state_hash`, `source: scripted`, verified evidence on both.
 
 Also verified: the ceiling error path, by setting `max_sse_event_bytes` to
 1,000,000 and confirming the failure **names its cause** rather than reporting a
 dead socket.
 
+Death absorption is **implemented and unit-tested but not yet seen live** — the
+bot died twice during this session's probing (Zombie, then Skeleton) but not
+during a `run-loop` step. The mechanism is a comparison of
+`situation.lastDeath.observedAt` across a step, so a re-death is not
+double-counted.
+
 ## Not yet verified
 
-- **Death absorption.** The live run ended with the bot at 4.5 health under a
-  spider. It never died, so `lastDeath` handling is still unexercised. The
-  standing `lastDeath` in the live world (`shot by Skeleton`, 2026-09-30) is from
-  an earlier session, not this run.
-- **Long objectives.** Only `collect_block` has run. A smelt is the reason
-  `tool_timeout_ms` is an hour and nothing has yet exercised it.
-- **`state_hash` is never populated.** Every ledger row records an empty hash. It
-  is the key the `Memo` cache needs, so it must be filled from a real state read
-  before Phase 4 — and its absence is why the D10 memo figures cannot be
-  reproduced from harness data.
+- **Death absorption, live.** Tested against the fake only. The `lastDeath` read
+  and the cross-step comparison both work against the real payload (the Skeleton
+  death at 14:28:19 is in the live vector), but no `run-loop` step has yet
+  absorbed one.
+- **Long objectives.** Only `collect_block` has run, and it settles in seconds. A
+  smelt is the reason `tool_timeout_ms` is an hour and nothing has yet exercised
+  it.
+- **A real decider.** `min_confidence` is unset, so every model-backed decision
+  would escalate and stop the run. There is no Laya client in `src/` at all —
+  `LayaConfig` and `LlmConfig` exist as configuration and nothing imports them.
 
 Still unbuilt, part of Phase 1 per `docs/architecture.md` §2.4 and §6:
 
+- a real decider behind the `Decider` seam (the seam itself is done)
 - cancellation
-- reconnection (re-read `/health.foreground`, reconnect)
-- death absorption (death mid-objective is an ordinary step outcome: absorb, report,
-  continue — never crash the run)
-- multiple objectives in sequence — **this is the loop itself, i.e. the bulk of Phase 1**
-- `SUBMISSION_CONFLICT` recovery (identifying the runner has, in `objective.py`; the
-  state machine does not yet)
-- `mcp.submission_prefix` per-process run prefix (documented in architecture §5, not yet
-  in `config.py`; `run_id` exists but `submission_id` is still a bare uuid4)
+- reconnection (re-read `/health.foreground`, reconnect) — `RUNTIME_UNAVAILABLE`
+  currently stops the run
+- `SUBMISSION_CONFLICT` recovery — deliberately **not** built; see D15
 
 ## Next move
 
-1. **Phase 1.** The runner loop: several objectives in sequence, plus the failure modes
-   above. Exit criterion is a scripted multi-objective run with every ledger row carrying
-   verified evidence. Start by reading the real state vector before each decision and
-   **stamping `state_hash`** — the loop is what makes the hash obtainable, and Phase 4's
-   memo cache needs it.
+1. **Phase 1 slice two.** The real decider behind `Decider`, plus cancellation and
+   reconnection. The blocking question is unchanged and still the user's call:
+   local Laya on MPS (needs the checkpoint, and `min_confidence` needs the Phase 3
+   eval before it can be set) or an API model. Until then a model-backed loop
+   escalates on every decision by design, which is correct but makes for a dull
+   demonstration.
 2. **Resolve duplication against `laya-mine`** before building further — it already has a
    reflex dataset builder (`build_reflex_dataset.py`, 293 labelled rows in `reflex.jsonl`)
    and baseline measurements
@@ -255,9 +307,10 @@ Still unbuilt, part of Phase 1 per `docs/architecture.md` §2.4 and §6:
    directive the reflex should run*; the reflex is already deterministic server-side and
    needs no gating, so those rows answer a **different question** than the harness does.
    Reuse them as a baseline, or treat as a separate experiment — open question.
-3. **Fix the tool-advertisement bloat in mine-ai-mcp** (its own repo). `wait_for_action`'s
-   913 KB `outputSchema` is `$ref` inlining. Capping at the client is correct but only
-   treats the symptom; a 2.91 MiB handshake is a real cost on every session.
+3. **The remaining advertisement bloat in mine-ai-mcp** is an API decision, not a
+   mechanical fix: 38% of what is left is four shared definitions copied into 36 of
+   37 tool schemas, and `definitions` cannot span documents. `a27d93a`'s commit
+   message carries the numbers so they need not be re-derived.
 
 ## Running a live leg
 
