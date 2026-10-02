@@ -15,6 +15,7 @@ from fake_host import run_host
 
 from harness.config import BudgetConfig, McpConfig
 from harness.decide import (
+    Completion,
     Escalation,
     Proposal,
     ScriptedArgumentError,
@@ -213,6 +214,63 @@ async def test_a_connected_bot_is_never_reported_as_a_dead_one(ledger_config):
     report = await build(client, ScriptedDecider([(TOOL, {})]), ledger_config).run()
     assert report.stop_reason == STOP_UNVERIFIED_STATE
     assert report.unverified_reads == 2
+
+
+async def test_a_model_that_says_it_is_done_leaves_a_row_behind(ledger_config):
+    """The decision that ends a run is the one you most want to read back.
+
+    Measured on 2026-10-02: the model collected logs correctly, then reported
+    nothing left to do. The loop stopped cleanly, the ledger held one successful
+    objective, and nothing anywhere said why the run ended there. The report said
+    `holds_item: holds 0x wooden_pickaxe` and the ledger could not say why anyone
+    believed otherwise. `Completion` makes the two cases distinguishable: `None`
+    is now only a spent script.
+    """
+
+    class Finished:
+        async def propose(self, vector, *, step):
+            if step:
+                return Completion(goal="wooden_pickaxe", reason="the pickaxe is crafted")
+            return Proposal(tool=TOOL, arguments={}, goal="wooden_pickaxe")
+
+    client = FakeClient(script={"view_status": [status()], TOOL: [settled("a1")]})
+    report = await build(client, Finished(), ledger_config).run()
+
+    assert report.stop_reason == STOP_PLAN_EXHAUSTED
+    assert report.ok, "a decider that answered has not failed; the checkers judge the claim"
+    rows = [row for row in Ledger(ledger_config, "loop-test").read_all() if row.get("outcome") == "completed"]
+    assert len(rows) == 1, "the completion must be a row, not an absence of one"
+    assert rows[0]["answer"] == "done"
+    assert rows[0]["question"]["goal"] == "wooden_pickaxe"
+    assert rows[0]["error"] == "the pickaxe is crafted"
+    assert rows[0]["state_hash"], "a completion still carries the state it was made from"
+
+
+async def test_an_escalation_ends_the_run_where_a_completion_does_not_ask_again(ledger_config):
+    """One is a refusal to answer; one is an answer with nothing left to run.
+
+    The difference is observable in two places, and both matter. An escalation is
+    an *incomplete* stop, so it never reads as success; a completion is a clean
+    stop, because the decider did answer - whether the answer was true is the
+    checkers' question. And an escalation is not asked again, whereas a completion
+    has still cost a model call, which is why it is recorded with its usage.
+    """
+    asked: list[int] = []
+
+    class Answers:
+        async def propose(self, vector, *, step):
+            asked.append(step)
+            return Completion(reason="nothing further worth doing") if step else Escalation(
+                reason="not confident enough"
+            )
+
+    client = FakeClient(script={"view_status": [status()], TOOL: [settled("a1")]})
+    report = await build(client, Answers(), ledger_config).run()
+    outcomes = {row.get("outcome") for row in Ledger(ledger_config, "loop-test").read_all()}
+    assert outcomes == {"escalated"}, "the run stops at the escalation; nothing follows it"
+    assert report.stop_reason == STOP_ESCALATED
+    assert not report.ok
+    assert asked == [0], "an escalation must not be answered again"
 
 
 async def test_a_healthy_bot_never_asks_health_at_all(ledger_config):

@@ -17,7 +17,8 @@ import pytest
 from conftest import FakeClient, settled, status
 
 from harness.config import BudgetConfig, LlmConfig, McpConfig
-from harness.decide import Proposal
+from harness.decide import Completion, Proposal
+from harness.goals import Goal, GoalBoard, GoalError, GoalSet
 from harness.ledger import Ledger
 from harness.llm import (
     LlmError,
@@ -336,12 +337,54 @@ async def test_confidence_is_null_and_the_gate_is_not_applied():
     assert proposal.confidence is None
 
 
-async def test_done_ends_the_plan_and_still_records_what_it_cost():
+async def test_done_is_a_recordable_answer_and_not_an_absence_of_one():
+    """`None` means a spent script; "the model says we are finished" is an answer.
+
+    Measured on 2026-10-02: a run collected its logs correctly, the model then
+    reported nothing left to do, and the loop stopped cleanly - with a ledger
+    holding one successful objective and *no record of the decision that ended
+    it*. The report said the bot held no pickaxe and the ledger could not say why
+    anyone believed otherwise.
+    """
     instance = decider(reply=answer(done=True, tool="collect_block", rationale="nothing left"))
 
-    assert await instance.propose(StateVector(), step=0) is None
+    claim = await instance.propose(StateVector(), step=0)
+    assert isinstance(claim, Completion)
+    assert claim.reason == "nothing left"
     assert len(instance.calls) == 1
     assert instance.calls[0].cost_usd == pytest.approx(0.00012)
+
+
+async def test_a_completion_names_the_goal_it_believes_is_met():
+    """Which goal the model thinks is done is the whole content of the claim."""
+    instance = decider(
+        reply=answer(done=True, goal="furnace", rationale="the furnace is crafted")
+    )
+    instance.goals = GoalBoard.of(GoalSet(("furnace",)), max_attempts=3)
+    claim = await instance.propose(StateVector(), step=0)
+    assert isinstance(claim, Completion)
+    assert claim.goal == "furnace"
+    assert claim.reason == "the furnace is crafted"
+
+
+async def test_a_goal_set_accepts_the_obvious_construction():
+    """`GoalSet(("furnace",))` is what a call site naturally writes.
+
+    Without coercion it built a set whose `items` raised `AttributeError: 'str'
+    object has no attribute 'item'`. A type annotation nobody checks is a comment.
+    """
+    assert GoalSet(("furnace", "white_bed")).items == ("furnace", "white_bed")
+    assert GoalSet((Goal("furnace", 2),)).items == ("furnace",)
+    with pytest.raises(GoalError):
+        GoalSet((3,))
+
+
+async def test_a_spent_script_still_returns_none():
+    """The two must stay distinguishable, or the reason for the change is lost."""
+    from harness.decide import ScriptedDecider
+
+    spent = ScriptedDecider([], [{"name": "collect_block"}])
+    assert await spent.propose(StateVector(), step=0) is None
 
 
 async def test_cost_is_measured_per_call():

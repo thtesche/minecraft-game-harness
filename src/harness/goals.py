@@ -62,6 +62,24 @@ class GoalSet:
 
     goals: tuple[Goal, ...]
 
+    def __post_init__(self) -> None:
+        # A bare string is accepted and wrapped, because ``GoalSet(("furnace",))``
+        # is the natural thing to write at a call site and the field's annotation
+        # promises a Goal. Without this the constructor happily produced a set whose
+        # ``items`` raised ``AttributeError: 'str' object has no attribute 'item'`` -
+        # and a type annotation that is not checked is a comment. Found by a test
+        # constructing the obvious thing.
+        coerced = tuple(
+            Goal(item=entry) if isinstance(entry, str) else entry for entry in self.goals
+        )
+        for entry in coerced:
+            if not isinstance(entry, Goal):
+                raise GoalError(
+                    f"a goal must be an item name or a Goal, got "
+                    f"{type(entry).__name__}: {entry!r}"
+                )
+        object.__setattr__(self, "goals", coerced)
+
     @property
     def items(self) -> tuple[str, ...]:
         return tuple(goal.item for goal in self.goals)

@@ -45,7 +45,7 @@ from typing import Any, Awaitable, Callable, Sequence
 import httpx
 
 from .config import LlmConfig
-from .decide import Proposal
+from .decide import Completion, Proposal
 from .errors import HarnessError
 from .goals import GoalBoard
 from .mcp_client import argument_names, input_schema_of
@@ -483,7 +483,15 @@ class OpenRouterDecider:
         decision = self._parse(response)
         self.calls.append(decision.usage)
         if decision.done:
-            return None
+            # A Completion rather than None. None means "this decider has nothing
+            # left to give" - true of a script that has run out, and a fact about
+            # the harness. Here it is the model's assertion that the work is
+            # finished, which is an answer about the goals and the most consequential
+            # thing the model says all run. Returning None made it indistinguishable
+            # from a spent script and left no ledger row, so a run that ended
+            # because the model believed it was finished - while holds_item said the
+            # bot held nothing - looked identical to a plan that ran out correctly.
+            return Completion(reason=decision.rationale, goal=decision.goal)
         return Proposal(
             tool=decision.tool or "",
             arguments=dict(decision.arguments),
@@ -544,8 +552,15 @@ class OpenRouterDecider:
         if not isinstance(arguments, dict):
             raise LlmError(f"model returned arguments as {type(arguments).__name__}, not an object")
         if body.get("done") is True:
+            # The goal is read here too. A completion says *which* goal the model
+            # believes is met, and that is the entire content of the claim - a
+            # `done` with no goal says only "stop", which is indistinguishable from
+            # running out of steam, and those are different findings. `_checked_goal`
+            # still applies, because a completion claiming an off-set goal is the
+            # model answering a different question than the one asked.
             return LlmDecision(tool=None, rationale=str(body.get("rationale") or ""),
-                               done=True, usage=self._usage(response))
+                               done=True, goal=self._checked_goal(body.get("goal")),
+                               usage=self._usage(response))
 
         if not isinstance(tool, str) or tool not in self._tools:
             raise LlmError(

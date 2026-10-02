@@ -28,7 +28,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .decide import Decider, Escalation, Proposal
+from .decide import Completion, Decider, Escalation, Proposal
 from .errors import BudgetExceeded, HarnessError, ObjectiveFailed
 from .goals import GoalBoard
 from .ledger import DecisionRow, Ledger
@@ -209,6 +209,16 @@ class RunLoop:
                 self._record_escalation(answer, vector, step)
                 report.stop_reason = STOP_ESCALATED
                 report.detail = answer.reason
+                return report
+
+            if isinstance(answer, Completion):
+                # A clean stop, because the decider answered: it believes there is
+                # nothing left to do. Whether that belief was *true* is the
+                # checkers' question and they are what say so - a loop that judged
+                # the claim itself would be grading the thing it is measuring.
+                self._record_completion(answer, vector, step)
+                report.stop_reason = STOP_PLAN_EXHAUSTED
+                report.detail = answer.reason or "the decider reported nothing left to do"
                 return report
 
             assert isinstance(answer, Proposal)
@@ -462,6 +472,36 @@ class RunLoop:
                 escalated=True,
                 escalation_reason=escalation.reason,
                 outcome="escalated",
+            )
+        )
+
+    def _record_completion(
+        self, completion: Completion, vector: StateVector, step: int
+    ) -> None:
+        """Write the decider's claim that the work is finished.
+
+        Recorded as a full row for the same reason an escalation is (D12): it is an
+        answer, not an absence of one. And specifically because this is the answer
+        that ends a run - measured on 2026-10-02, a run collected its logs correctly
+        and then the model reported nothing left to do, which stopped the loop
+        cleanly with a ledger holding one successful objective and no record of the
+        decision that ended it. The report said ``holds_item: holds 0x
+        wooden_pickaxe`` and the ledger could not say why anyone believed otherwise.
+
+        ``outcome`` is ``completed``, deliberately distinct from ``escalated``: one is
+        an answer with nothing to run and one is a refusal to answer at all.
+        """
+        question: dict[str, Any] = {"kind": "completion", "step": step}
+        if completion.goal is not None:
+            question["goal"] = completion.goal
+        self._record(
+            DecisionRow(
+                state_vector=vector.to_dict(),
+                state_hash=vector.state_hash,
+                question=question,
+                answer="done",
+                outcome="completed",
+                error=completion.reason or None,
             )
         )
 

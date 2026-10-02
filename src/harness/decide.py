@@ -60,6 +60,31 @@ class Escalation:
     question: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class Completion:
+    """The decider's claim that the run has nothing left to do.
+
+    A distinct answer rather than ``None``, for two reasons. First, ``None``
+    already means something else - a *harness* fact, that a script ran out - and
+    overloading one value with "the script is empty" and "the model believes the
+    work is finished" makes the second invisible. Second, this one is a claim
+    about the goals, so it is recorded like any other answer: the run's most
+    consequential model output is the one that ends it, and a run that stops
+    because the model thinks it is finished while the goal checkers say otherwise
+    is precisely the case someone needs to read back.
+
+    Not an :class:`Escalation`. An escalation is a refusal to answer and stops
+    the run as incomplete; a completion is an answer, and stopping cleanly is
+    correct - whether the answer was *true* is the checkers' question, not the
+    loop's.
+    """
+
+    #: The decider's own words for why it stopped, kept verbatim.
+    reason: str = ""
+    #: The goal the decider believes is met, when it said.
+    goal: str | None = None
+
+
 @runtime_checkable
 class Decider(Protocol):
     """Chooses the next objective, or declines to.
@@ -81,7 +106,7 @@ class Decider(Protocol):
         vector: StateVector,
         *,
         step: int,
-    ) -> Proposal | Escalation | None: ...
+    ) -> Proposal | Escalation | Completion | None: ...
 
 
 def confidence_gate(
