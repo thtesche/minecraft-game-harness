@@ -25,11 +25,12 @@ transcript rows):
 ## Current state
 
 Phase 1 slice one is **live-verified** at `35302ae`; the Phase 2 model decider is
-live-verified at `df7af20`. 149 tests pass, working tree clean.
+live-verified at `df7af20`. The **goal list and scenario checker** are done and
+pushed at `7ac306a`/`dd2188a` — the mechanism, not a passing run. 233 tests pass.
 
 ```
 $ .venv/bin/python -m pytest -q
-149 passed in 4.01s
+233 passed in 4.20s
 ```
 
 Against a real Minecraft 1.21.4 host: `health` → 37 tools · `state` →
@@ -191,6 +192,13 @@ contracts. Full reasoning in `docs/harness_idea.md` §5.
 | D18 | **`craft_item` is the decomposition engine, so the harness holds no recipe knowledge and calls no planner.** Measured: the reference run called `view_crafting_requirements` **zero** times in 388 calls. It asked for items by name and read the recipe tree, leaf materials and workstation requirement out of the `craft_item` *result* — 23 calls, 27 distinct items, 66 units. An earlier plan to call the planner once per goal is therefore dropped: it would pay for information the craft reply already carries. A goal is an **item name**, not a procedure. |
 | D19 | **A scenario is a prompt, a world, and a checker; without the third it is a demo.** The checker is written *before* the run. "It reached a wooden pickaxe" is a fact; "the run looked reasonable" is not. This is the same line `docs/harness_idea.md:152` draws for phases, applied to individual runs. |
 | D20 | **The reference run's per-call cost is not a target and its $0.240 is not comparable to ours.** Opus list price against a `cost: 0` free model compares two different things; only token counts transfer. Its 388 calls are a *ceiling*, not a target. Recorded because the temptation to quote the cheaper number is exactly what makes a baseline unreadable. |
+| D21 | **The goal list is not pre-ordered.** `GoalSet` accepts a set and refuses to act on an order it was not given, because a harness that sorts the goals has written the plan itself and the decider's ordering mistakes become invisible. Ordering is the measurement. |
+| D22 | **Checkers read the world themselves, not the loop's report.** The loop's `StateVector` is deliberately lossy — twelve stacks, to keep the prompt small — so a checker reading it would report "no pickaxe" for a bot holding one in slot twenty, and that failure is indistinguishable from the bot failing. |
+| D23 | **An unknown check kind is refused at load time, never evaluated as true.** A scenario naming a check that does not exist must not run green; a scenario that cannot fail looks exactly like one that passed. The refusal lists the kinds that do exist. |
+| D24 | **The loop refuses two kinds of off-goal objective, and both stop the run.** `goal_unknown` when the decider names no goal at all or one outside the set — counting progress toward a goal nobody asked for corrupts the measurement the scenario exists to make. `goal_attempts_exhausted` when past `budget.max_attempts_per_goal` — spending a real objective, and 20–37 s of model, on work the harness has already declared it will stop doing. Both in `INCOMPLETE_STOPS`, so neither reads as success. |
+| D25 | **The per-goal cap counts attempts, not failures.** A long recipe is not a stuck loop; eight failed attempts at one goal and eight attempts at a goal that needs six steps are different things, and only the second is a cap. |
+| D26 | **A run-shaped check refuses to pass on a run that made no call.** `no_death`, `within_calls` and `evidence_verified` are universals over the set of steps, and over an empty set all three are vacuously true. Found by running scenario 1 live against a disconnected bot: the loop stopped correctly and two checks still printed green for a run in which the bot never moved. A check that passes on nothing has not passed. |
+| D27 | **Unreadable and unrankable are different, and the two consumers disagree on purpose.** `StateVector.unverified` holds both, because a decider that cannot rank what it is holding should be told so. `WorldFacts.unverified` holds only sections the harness could not parse; an equipment tier outside the harness order is a *warning*, because "is the best tool at least stone" is still answerable when the bot also holds a trident. Folding the two together would fail a passing run for a reason that is not the reason. |
 
 ## Laya operating limits
 
@@ -364,12 +372,63 @@ acquired on call 4 (results are markdown, not JSON), and an argument map keyed b
 showed every `craft_item` asking for `shears`. A check that finds nothing is not evidence of
 absence, and a check that stops running is indistinguishable from one that passes.
 
+## Scenario 1, first live attempt 2026-10-02 — refused, and that is the result
+
+`run-scenario scenarios/first-pickaxe.json` against the live host produced:
+
+```
+scenario: first-pickaxe  ->  FAIL
+  [FAIL] world: the world could not be read after the run
+  [FAIL] goal_succeeded: the run recorded no goal attempts
+  [FAIL] evidence_verified: the run made no tool call, so evidence_verified has nothing to measure
+  [FAIL] within_calls: the run made no tool call, so within_calls has nothing to measure
+  loop stopped: unverified_state: the world could not be read after 2 attempt(s)
+```
+
+**Why:** the bot's Minecraft connection ended. `minecraft.connected: false`,
+`vitals: null`, health 5.4, food 5, holding 4 dirt + 1 oak_log + 3 acacia_log.
+The MCP host itself is alive (PID 15601) and the Minecraft server is up (25565
+accepts); only the bot's socket closed. `mine-ai-mcp/src/server/runtime-host.ts:143`
+says so in its own comment: *"A new Minecraft connection requires an explicit
+service restart."* There is no reconnect path in the server and none in the
+harness, so this is the `RUNTIME_UNAVAILABLE` recovery from Phase 1 slice two,
+still unbuilt. Restarting the host is the operator's call.
+
+Two things worth keeping from the failure:
+
+1. **The read refused rather than defaulted.** No situation was found in either
+   reply shape and the run stopped instead of submitting into whatever the server
+   had. The world checks then failed saying the read failed — never passed on
+   absent evidence.
+2. **Two checks passed vacuously and were caught by looking.** `evidence_verified
+   0/0` and `within_calls 0 of 8` printed green for a run in which the bot never
+   moved. The overall verdict was already correct, because `ScenarioReport.passed`
+   also requires a clean loop — but a reader scanning the report saw green under a
+   dead run. Fixed as D26.
+
+**Two real bugs came out of writing the fixture from the wire** rather than from
+memory, and the wire is `mine-ai-mcp/src/actions/view-status/contract.ts`
+(`inventoryStackSchema`, `toolSnapshotEntrySchema`, `clock`, `lastDeath`):
+
+- The tools rows were keyed by `row["item"] or row["tier"]`, which produces keys
+  like `"none"` and `"wooden_pickaxe"` for a row the server keys by `class`.
+  `world_facts` now calls `state.best_equipment()`, so the prompt and the checker
+  cannot disagree about which tool is best — a disagreement that would be
+  indistinguishable from the bot not holding one.
+- A reply with **no `inventory` key at all** read as an empty inventory, because
+  only the shape was checked, not the presence. Now `unverified`, so a broken read
+  cannot become a red run that looks like a bot that failed.
+
 ## Not yet verified
 
+- **Scenario 1 passing, live.** Never run against a bot that was connected. The
+  target is ≤8 objective submissions to hold `wooden_pickaxe`; the reference did it
+  in 2 submissions / 4 calls. Watch for the model re-proposing `collect_block logs`,
+  which it did three times in Phase 1.
 - **Death absorption, live.** Tested against the fake only. The `lastDeath` read
   and the cross-step comparison both work against the real payload (the Skeleton
   death at 14:28:19 is in the live vector), but no `run-loop` step has yet
-  absorbed one.
+  absorbed one. Scenario 2 (survive one night) is what will finally exercise it.
 - **Long objectives.** Only `collect_block` has run, and it settles in seconds. A
   smelt is the reason `tool_timeout_ms` is an hour and nothing has yet exercised
   it.
@@ -388,7 +447,16 @@ Still unbuilt, part of Phase 1 per `docs/architecture.md` §2.4 and §6:
 
 ## Next move
 
+0. **Blocked on an operator action: restart the mine-ai-mcp host.** The bot's
+   Minecraft connection ended and the server will not reconnect on its own. Until
+   it is restarted no scenario can run, and a run attempted against a disconnected
+   world measures the disconnection. Note that restarting does *not* restore
+   "from nothing" — the bot rejoins holding 4 dirt and 4 logs — so scenario 1's
+   premise needs either accepting that starting state (recorded in the scenario's
+   `reference` block) or a fresh world with a named seed. **The user's call, not
+   mine: it is their service and their world.**
 1. **Scenario 1 — reach a wooden pickaxe from nothing — plus the checker mechanism.**
+   Mechanism done and pushed (`7ac306a`, `dd2188a`); the run is what is missing.
    This is the make-or-break for goal-list mode: if the model cannot sequence
    logs → crafting table → wooden pickaxe from an unordered goal list, the rest is
    wasted effort. Its baseline is **four calls**, of which two are reads. A scenario
