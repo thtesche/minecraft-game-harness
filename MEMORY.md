@@ -77,6 +77,23 @@ Five defects surfaced only against the live world; all five passed the suite:
 | 4 | `fake_host.py` encoded the client's assumptions, not the contract |
 | 5 | `ACTION_BUSY` with no action id (a survival reflex) was treated as terminal |
 
+**A third, and the sharpest one yet: a check that stopped running is
+indistinguishable from a check that passes.** `ScriptedDecider`'s guard against a
+mistyped argument name read `tool["inputSchema"]`. The MCP specification says
+`inputSchema`; mine-ai-mcp publishes `input_schema`, and `list_tools` dumps the
+SDK model without `by_alias`, so snake_case is what every consumer here has ever
+seen. The guard therefore **never ran against the live host** — verified before
+changing anything: `block_typo` was accepted on `collect_block`, and the server
+*drops* an unrecognised argument rather than refusing it, so the objective ran
+against the wrong thing and reported success.
+
+Two unit tests kept it green because both **hand-wrote** the tool table with
+`inputSchema`. That is the same mistake as #4 in miniature: a fixture states what
+the author believes the server sends. The replacement reads an advertisement off
+a real MCP server, so it cannot drift again. **Write fixtures from the wire, not
+from memory** — and when a check has never been observed failing, assume it is
+not running until you have seen it fail.
+
 ## Live host facts, measured 2026-10-02
 
 - **Reply shapes.** Envelope: `{state, actionId, output}`. Direct:
@@ -100,6 +117,26 @@ Five defects surfaced only against the live world; all five passed the suite:
   **not** a missing section — requiring it would report every new session
   unverified. The live bot died twice this session (Zombie 12:30:36, Skeleton
   14:28:19).
+- **The input side of `tools/list` is tiny.** All 37 tools' name + description
+  + `input_schema` = **28,799 bytes** (~7.2K tokens), against a 2.4 MB total that
+  is almost entirely output schemas. A decision needs only the input side, so
+  the whole catalogue ships on every call with no filtering heuristic: **16,767
+  prompt tokens** measured live. `submission_id` is stripped from it (D15).
+- **The advertised schema key is `input_schema`,** not the specified
+  `inputSchema` — and `McpClient.list_tools` dumps the SDK model without
+  `by_alias`, so snake_case is what every consumer here sees. See the lesson
+  below; this already cost one silently-disabled guard.
+- **`nvidia/nemotron-3-ultra-550b-a55b:free` behaviour, measured.** 262K context,
+  advertises `response_format` and `structured_outputs`, reports `cost: 0`.
+  **It ignores an advisory schema and needs `strict: true`** — the first live
+  call returned chain-of-thought in `content` with the constraint silently
+  dropped. It **truncates**: ~300–430 reasoning tokens come before the answer, so
+  a 1024-token ceiling cut the object off mid-brace with
+  `finish_reason: "length"`; the ceiling is now 4096. It sometimes returns the
+  object **wrapped in a JSON string**, which parses cleanly and then fails every
+  field lookup. And its free provider is **overloaded a lot** — three of four
+  probes returned 503 — so retryable failures retry and the attempt count is
+  recorded. Latency **20–37 s per decision**; that is the cost of this baseline.
 - **Remaining advertisement bloat** is not inlining. 38% of what is left
   (1,016,964 B) is four identical shared definitions repeated into 36 of 37
   tool schemas — `MineAiSurvivalPolicySnapshot` alone is 533,880 B. `$defs`
@@ -149,6 +186,8 @@ contracts. Full reasoning in `docs/harness_idea.md` §5.
 | D13 | **`state_hash` is quantised, and the claim it makes is deliberately weak.** Hashed verbatim it never repeats — two reads a second apart differ in position — so a Memo cache keyed on it records one hit in a thousand rows and is indistinguishable from a model ignoring it. Vitals bin to a whole point, position to half a chunk, distances to a block; discrete facts hash exactly. Two states with the same hash are identical *in every respect a decision could turn on*, which is the property a cache needs and a stronger claim than this can honestly make. |
 | D14 | **A death is not a stop condition.** The bot respawns and remaining objectives are still answerable, so the loop absorbs it, records it against the objective it interrupted, and continues. It costs one extra state read, and only after an objective that did *not* succeed — death cannot make a succeeded objective not have succeeded. |
 | D15 | **`SUBMISSION_CONFLICT` has no recovery, on purpose.** The refusal names no action, so the earlier submission holding that id cannot be found from it, and that work may still be running. The only defence is making the collision impossible; `mcp.submission_prefix` is for attribution, so an id seen twice is identifiable as ours. |
+| D16 | **The model decider is not gated, and records `confidence: null`.** `confidence_gate` is a Laya policy about a classifier with fitted temperatures. A frontier model asked for a JSON objective has no such number. A fixed `1.0` was proposed to unblock the loop and is refused twice over: the harness would be inventing a certainty it has no evidence for, and it would pass *any* threshold fitted in Phase 3, so the calibration mechanism would go in green reporting that calibration happened when nothing was measured. Not applying the gate gets the loop running exactly as asked, with `None` in the ledger meaning what it means. |
+| D17 | **The model chooses from the 27 tools that submit work, not all 37.** The ten reads and controls are excluded by a list declared in `llm.py`: an advertisement says nothing about being an objective, and the server's tier enums are not a ranking of these (D13). Default is *open*, so a tool the server adds later works without a change here. |
 
 ## Laya operating limits
 
@@ -182,14 +221,15 @@ is exactly why they are code rather than prompt text.
 | File | Role |
 |---|---|
 | `src/harness/config.py` | Every bound, each existing because something was measured to run away without it. Unknown config keys **raise** — a typo that is ignored produces a harness that does not do what its author believes. |
-| `src/harness/mcp_client.py` | Streamable HTTP, forces `response_format: json`, builds its own timeouts. |
+| `src/harness/mcp_client.py` | Streamable HTTP, forces `response_format: json`, builds its own timeouts. `input_schema_of` / `argument_names` read the advertised schema under either spelling — see the lesson below. |
 | `src/harness/objective.py` | The protocol state machine. |
 | `src/harness/state.py` | `view_status` → compact decision vector. Missing sections land in `unverified`, never as zeros. |
 | `src/harness/ledger.py` | JSONL + SQLite, one row per decision, flushed per row. |
 | `src/harness/loop.py` | The deterministic loop: read a trusted state, ask the decider, run, record. Three stop conditions (plan exhausted / escalated / unreadable); a death is not one. |
 | `src/harness/decide.py` | The model seam. `Proposal | Escalation | None` — three answers, and the third is the one that gets forgotten. `ScriptedDecider` is the Phase 1 stand-in and marks every row `source: "scripted"`. |
+| `src/harness/llm.py` | `OpenRouterDecider`: the Phase 2 baseline. Every decision is one HTTP call. Validates the model's tool and arguments against the advertisement, records cost, retries only what is worth retrying, and deliberately does **not** apply `confidence_gate` (D16). Also `load_dotenv`. |
 | `src/harness/errors.py` | `UnverifiedRead` / `ProtocolError` / `ObjectiveFailed` / `BudgetExceeded`. |
-| `src/harness/cli.py` | `health`, `state`, `run-one`, `run-loop`, `ledger`. |
+| `src/harness/cli.py` | `health`, `state`, `run-one`, `run-loop` (`--decider script\|llm`), `ledger`. |
 | `src/harness/sse.py` | The **only** module that patches the SDK. Raises if the SDK's call site moves; distinguishes "raise the ceiling" from "the patch stopped working". |
 
 `ToolReply` is deliberately **shape-aware**: `is_protocol`, `state` (which may be
@@ -243,6 +283,12 @@ exact failure this project measures around. There is a test pinning this.
 - `tests/fake_host.py` — a real MCP server over Streamable HTTP reimplementing the
   submission protocol from the contract
 - `tests/test_live_client.py` — the real client against that stand-in
+- `tests/test_llm.py` — the model decider, 37 tests, and **37 of them refuse
+  something**: no key, no model named, an advertised tool that names no
+  arguments, a 401, a 429 that is retried, an overload that never clears, a
+  truncated answer, reasoning with no answer, prose, an object wrapped in a JSON
+  string, an unadvertised tool, an invented argument name, an omitted required
+  argument. No test opens a socket; the transport is injected.
 
 The stand-in reproduces the **transport and protocol only**. It reports no physical
 world outcome that a test then believes. It is not Minecraft.
@@ -258,8 +304,17 @@ than quietly assumed.
 
 Live, against Minecraft 1.21.4 with the bot joined as `MineAI`: `health` → 37
 tools, SSE patch live · `state` → trustworthy, `unverified: []` · `run-loop` (two
-objectives) → both sequenced, `plan_exhausted`, exit 0 · `ledger` → two rows with
-unique `state_hash`, `source: scripted`, verified evidence on both.
+objectives, scripted) → both sequenced, `plan_exhausted`, exit 0 · `ledger` →
+two rows with unique `state_hash`, `source: scripted`, verified evidence on both.
+
+**`run-loop --decider llm`, end to end.** The model read a live state (health
+13.2, food 17.0, `best_tool: null`, carrying `dirtx2`) and chose
+`collect_block {block_name: logs, count: 4}` — wood for a pickaxe, which is the
+correct first move with nothing held. It settled **succeeded**, evidence
+verified, 34.5 s. Ledger row: `source: "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free"`,
+`answer_confidence: null`, `escalated: false`, `state_hash: ce8cc645e60ddc46`.
+Cost **$0**, 16,767 prompt + 429 completion tokens (315 of them reasoning),
+0 retries.
 
 Also verified: the ceiling error path, by setting `max_sse_event_bytes` to
 1,000,000 and confirming the failure **names its cause** rather than reporting a
@@ -280,13 +335,14 @@ double-counted.
 - **Long objectives.** Only `collect_block` has run, and it settles in seconds. A
   smelt is the reason `tool_timeout_ms` is an hour and nothing has yet exercised
   it.
-- **A real decider.** `min_confidence` is unset, so every model-backed decision
+- **A real decider.** `min_confidence` is unset, so every *Laya*-backed decision
   would escalate and stop the run. There is no Laya client in `src/` at all —
-  `LayaConfig` and `LlmConfig` exist as configuration and nothing imports them.
+  `LayaConfig` is configuration and nothing imports it. `LlmConfig` is now live
+  through `llm.py`; see D16 for why that path is deliberately not gated.
 
 Still unbuilt, part of Phase 1 per `docs/architecture.md` §2.4 and §6:
 
-- a real decider behind the `Decider` seam (the seam itself is done)
+- a Laya-backed decider (the `Decider` seam is done and filled by the model one)
 - cancellation
 - reconnection (re-read `/health.foreground`, reconnect) — `RUNTIME_UNAVAILABLE`
   currently stops the run
@@ -294,23 +350,32 @@ Still unbuilt, part of Phase 1 per `docs/architecture.md` §2.4 and §6:
 
 ## Next move
 
-1. **Phase 1 slice two.** The real decider behind `Decider`, plus cancellation and
-   reconnection. The blocking question is unchanged and still the user's call:
-   local Laya on MPS (needs the checkpoint, and `min_confidence` needs the Phase 3
-   eval before it can be set) or an API model. Until then a model-backed loop
-   escalates on every decision by design, which is correct but makes for a dull
-   demonstration.
-2. **Resolve duplication against `laya-mine`** before building further — it already has a
+1. **Cancellation and reconnection.** The decider seam is filled — `ScriptedDecider`
+   and `OpenRouterDecider` both work — so what is left of Phase 1 slice two is
+   `cancel_foreground_action` and `RUNTIME_UNAVAILABLE` recovery (re-read
+   `/health.foreground`, reconnect). Note the baseline's shape when judging them:
+   **20–37 s per decision**, so a cancelled objective wastes real money, not just
+   time.
+2. **A longer model-backed run.** One objective has been decided live and
+   succeeded. What is unmeasured is whether the model keeps making *progress* over
+   a run — it proposed `collect_block logs` three times against an unchanged
+   state, which is correct for one step and a loop hazard for twenty. Whether that
+   is a prompting problem or the baseline simply being weak is the measurement
+   Phase 2 exists to take.
+3. **Resolve duplication against `laya-mine`** before building further — it already has a
    reflex dataset builder (`build_reflex_dataset.py`, 293 labelled rows in `reflex.jsonl`)
    and baseline measurements
    (`measurements/baseline-original-super120b.json`). Its rows predict *which survival
    directive the reflex should run*; the reflex is already deterministic server-side and
    needs no gating, so those rows answer a **different question** than the harness does.
    Reuse them as a baseline, or treat as a separate experiment — open question.
-3. **The remaining advertisement bloat in mine-ai-mcp** is an API decision, not a
+4. **The remaining advertisement bloat in mine-ai-mcp** is an API decision, not a
    mechanical fix: 38% of what is left is four shared definitions copied into 36 of
    37 tool schemas, and `definitions` cannot span documents. `a27d93a`'s commit
    message carries the numbers so they need not be re-derived.
+5. **A Laya-backed decider**, when the checkpoint is available. `min_confidence`
+   still needs the Phase 3 eval before it can be set — and per D16 the gate will
+   escalate every decision until it is.
 
 ## Running a live leg
 
@@ -325,6 +390,17 @@ bun src/server/host.ts --minecraft-host 127.0.0.1 --minecraft-port 25565 \
 Then `harness health` is the reachability check. The host is spawned **per session**
 and does not survive a restart; `~/.mine-ai/bot-data` persists the frontier across
 runs, so a restart resumes rather than restarting.
+
+`run-loop --decider llm` needs a key: `cp .env.example .env`, fill in
+`OPENROUTER_API_KEY`, and export it. `.env` is gitignored, `.env.example` is
+tracked, and `load_dotenv` never overwrites a variable already in the
+environment. The key goes in the `Authorization` header and nowhere else — not
+the config file, not the ledger, not an error message.
+
+```sh
+.venv/bin/python -m harness.cli --config harness.config.json run-loop \
+  --decider llm --max-steps 8
+```
 
 ## Related files elsewhere
 

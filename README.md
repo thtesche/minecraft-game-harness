@@ -5,12 +5,14 @@ A standalone application that plays Minecraft through
 [Laya](https://nandhakishorm.github.io/laya/) gating the decisions so that a frontier
 LLM is called far less often.
 
-> **Status: Phase 1 slice one, verified live.** The skeleton connects, reads state, runs
-> one objective end to end, and records a ledger row. On top of that now sits the decision
-> loop: several objectives in sequence, one trusted state read before each, every ledger
-> row carrying the state its decision was made against. Verified against a real Minecraft
-> 1.21.4 world, not only a stand-in — the live legs found five defects the whole suite had
-> passed. See [Running it](#running-it) and [Roadmap](#roadmap).
+> **Status: Phase 1 slice one, verified live, with the Phase 2 baseline running.** The
+> skeleton connects, reads state, runs one objective end to end, and records a ledger row.
+> On top of that sits the decision loop: several objectives in sequence, one trusted state
+> read before each, every ledger row carrying the state its decision was made against. The
+> model seam is now filled by a real model — `run-loop --decider llm` asks a frontier model
+> for every objective and reports what it cost. Verified against a real Minecraft 1.21.4
+> world, not only a stand-in — the live legs found defects the whole suite had passed. See
+> [Running it](#running-it) and [Roadmap](#roadmap).
 
 ## The problem
 
@@ -68,8 +70,8 @@ proceed — that is the difference between a measurement and an assumption.
 | Phase | Deliverable | Exit criterion | State |
 |---|---|---|---|
 | 0 — Skeleton | Connect, read status, run one objective, write a ledger row | One objective completes unattended, one ledger row exists | **done, live-verified** |
-| 1 — Runner | The submit → wait → retrieve protocol state machine, then a loop over them | A scripted multi-objective run, every row with verified evidence | **slice one done**; a real decider, cancellation and reconnection remain |
-| 2 — Baseline | LLM on every decision, on a named scenario set | A measured calls-per-objective number | next |
+| 1 — Runner | The submit → wait → retrieve protocol state machine, then a loop over them | A scripted multi-objective run, every row with verified evidence | **slice one done**; cancellation and reconnection remain |
+| 2 — Baseline | LLM on every decision, on a named scenario set | A measured calls-per-objective number | **decider built and live-verified**; the scenario set is not |
 | 3 — Eval gate | ≥ 200 labelled decisions, `laya-evals`, temperature refit | A documented planner/gatekeeper/fine-tune decision | |
 | 4 — Gated loop | Laya wired in at the decision point | Fewer LLM calls per objective, success rate not regressed | |
 | 5 — Fine-tune | Conditional on Phase 3 | Held-out calibration, not training-split accuracy | |
@@ -124,20 +126,23 @@ needs, and a stronger claim than this can honestly make.
 ```bash
 uv venv && uv pip install -e ".[dev]"
 cp config.example.json harness.config.json   # then point mcp.url at your host
+cp .env.example .env                         # then fill in OPENROUTER_API_KEY
 
 harness health                              # /health plus the published tool count
 harness state                               # the derived decision vector
 harness run-one collect_block --arguments '{"block_name": "dirt"}'
 harness run-loop --script '[{"tool":"collect_block","arguments":{"block_name":"dirt","count":2}}]'
+harness run-loop --decider llm --max-steps 8
 harness ledger --counts
 ```
 
 `harness run-loop` runs its objectives in order, printing one line per step on stderr
 and the run summary on stdout. A real objective takes minutes, so a loop that reports
-only at exit is indistinguishable from a hung process. The `--script` is the
-`ScriptedDecider` standing in for a model; every row it writes is marked
-`source: "scripted"` with a null confidence, so a scripted run is never mistaken for a
-model run.
+only at exit is indistinguishable from a hung process. `--decider script` replays
+`--script` through the `ScriptedDecider`; `--decider llm` asks the model named in
+`llm.model` on every decision. Either way each row records which one produced it —
+`source: "scripted"` or `source: "openrouter:<model>"` — so a scripted run is never
+mistaken for a model run.
 
 Start mine-ai-mcp first; `harness health` is the check that the host is reachable.
 
@@ -150,6 +155,43 @@ bun src/server/host.ts --minecraft-host 127.0.0.1 --minecraft-port 25565 \
 `harness state` exits non-zero when the vector is not trustworthy. That is deliberate: a
 section the contract promises but the reading did not find is reported, never replaced
 with a zero. An invented number is invisible, an escalation is not.
+
+### The model decider
+
+`--decider llm` is the Phase 2 baseline: a frontier model chooses **every**
+objective, and the run reports what that cost. That number is the point. A later
+decider that is cheaper has to be measured against this one, which means this one
+has to be measured rather than assumed.
+
+The model picks from the **27 tools that submit work**, not all 37. The ten reads
+and controls are excluded by a list declared in `llm.py`, because an advertisement
+says nothing about being an objective and the server's own tier enums are not a
+ranking of these. A model handed `wait_for_action` will eventually call it, racing
+the runner for an action the runner already owns. Everything else is offered, so a
+tool the server adds later works without a code change.
+
+The whole catalogue fits in a prompt, which was measured before it was designed
+around: the *input* side of all 37 advertisements is 28,799 bytes against a 2.4 MB
+total that is almost entirely output schemas describing results the model never
+reads. So there is no filtering heuristic here to drift out of date — 16,767
+prompt tokens per call, live.
+
+**It records `confidence: null`, and does not apply the confidence gate.** A fixed
+`1.0` was proposed to get the loop running and was refused: the harness would be
+inventing a certainty it has no evidence for, and it would pass *any* threshold
+fitted later, so the calibration mechanism would go in green reporting that
+calibration had happened when nothing had been measured. The gate is a Laya policy
+about a classifier with fitted temperatures, and this is not that.
+
+What the model gets wrong, found by calling it rather than reasoning about it, and
+each now refused by name: it answers prose when the schema is advisory (so
+`strict: true` is set); it truncates, and `finish_reason: "length"` is reported as
+truncation rather than as a parse error about a brace; it sometimes returns the
+object wrapped in a JSON *string*, which parses cleanly and then fails every field
+lookup; and it invents argument names. That last one matters more than with a
+script, because the server **drops** an argument it does not recognise instead of
+refusing it — so every proposal is checked against the advertised `input_schema`
+before it is submitted.
 
 ### Two reply shapes, and why the live leg mattered
 
@@ -196,6 +238,17 @@ neither of which the real host uses. The client and the fixture therefore agreed
 test passed, and `harness state` was broken live in two independent ways. A fake that
 encodes what the code under test believes amplifies exactly the bug it exists to catch.
 
+The same mistake has a smaller form that cost just as much: a unit test that
+**hand-writes** the shape it is testing. Two tests did that for tool schemas, spelling
+them `inputSchema` as the MCP specification says — while `mine-ai-mcp` publishes
+`input_schema`. So the guard against a mistyped argument name, which exists precisely
+because the server drops an unrecognised argument instead of refusing it, never ran
+against the live host. `block_typo` was accepted on `collect_block`; the objective would
+have run against the wrong thing and reported success. The replacement reads an
+advertisement off a real MCP server, so it cannot drift again. **A check that stopped
+running looks exactly like a check that passes**, and **write fixtures from the wire,
+not from memory**.
+
 ## A note on the numbers
 
 Figures in these documents were checked against the Laya model card and the mine-ai-mcp
@@ -211,6 +264,11 @@ tool contracts rather than taken from a marketing summary. The ones that moved:
 - **Routing over the tool list** is Laya's measured collapse case: at 48 options the
   default head budget scores **1/48**, because similar labels get trimmed until they reach
   the model as the same text.
+- **A frontier model is not free just because it is one call.** On the live baseline it
+  cost 20–37 s per decision, most of it reasoning tokens emitted before the answer — and
+  roughly half its probes failed outright with a provider-overload 503, which is why
+  retryable failures retry and the attempt count is recorded. The lever is calls per
+  objective, but latency and reliability are part of that number too.
 
 [harness_idea.md §5](docs/harness_idea.md#5-what-this-document-corrects) records all of
 them, including why each looked reasonable in the first place.
