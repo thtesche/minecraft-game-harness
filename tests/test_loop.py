@@ -371,3 +371,38 @@ def test_a_threshold_is_enforced_in_both_directions():
 def test_a_missing_confidence_escalates_even_under_a_set_threshold():
     """A decider that omits its confidence has not earned the threshold."""
     assert confidence_gate(None, 0.50) is not None
+
+
+# --- the CLI surface --------------------------------------------------------
+
+
+def test_a_malformed_script_is_named_not_raised(capsys):
+    """A quote left out of a shell command is a typo, and a traceback sends the
+    reader looking through the JSON parser instead of at their own command."""
+    from harness.cli import main
+
+    assert main(["run-loop", "--script", "not a list"]) == 64
+    assert "--script is not valid JSON" in capsys.readouterr().err
+
+
+def test_a_script_that_is_not_a_list_of_entries_is_refused(capsys):
+    from harness.cli import main
+
+    assert main(["run-loop", "--script", '{"tool": "collect_block"}']) == 64
+    assert "must be a JSON list" in capsys.readouterr().err
+
+
+def test_a_script_entry_without_a_tool_is_refused(capsys):
+    from harness.cli import main
+
+    assert main(["run-loop", "--script", '[{"arguments": {}}]']) == 64
+    assert "no tool" in capsys.readouterr().err
+
+
+def test_run_loop_without_a_script_says_why(capsys):
+    """There is no model to choose objectives yet, and an empty run that reports
+    success would be indistinguishable from a finished one."""
+    from harness.cli import main
+
+    assert main(["run-loop"]) == 64
+    assert "no model to choose objectives" in capsys.readouterr().err

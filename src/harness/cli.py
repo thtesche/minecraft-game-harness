@@ -122,7 +122,17 @@ async def cmd_run_loop(args: argparse.Namespace) -> int:
     for a model run.
     """
     config = _config(args)
-    script = json.loads(args.script) if args.script else []
+    if not args.script:
+        print("run-loop needs --script; there is no model to choose objectives yet",
+              file=sys.stderr)
+        return 64
+    try:
+        script = json.loads(args.script)
+    except json.JSONDecodeError as error:
+        # Named rather than raised: a quote left out of a shell command is a typo,
+        # and a traceback sends the reader looking through the parser.
+        print(f"--script is not valid JSON: {error}", file=sys.stderr)
+        return 64
     if not isinstance(script, list) or not all(isinstance(entry, dict) for entry in script):
         print('script must be a JSON list of {"tool": ..., "arguments": {...}}', file=sys.stderr)
         return 64
