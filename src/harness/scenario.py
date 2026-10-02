@@ -408,14 +408,22 @@ def _check_starts_from(starts_from: dict[str, Any], source: str) -> None:
 def start_mismatch(scenario: Scenario, facts: WorldFacts | None) -> str | None:
     """Why the world is not the one this scenario's number is valid from.
 
-    ``None`` when it matches, when the scenario declares no precondition, or when
-    the world could not be read - the last of which is *not* a match. An
-    unreadable world is reported as such rather than passed, so the caller can
-    refuse; saying "the precondition holds" about a world it never read is the
-    one answer that would be a lie.
+    ``None`` when it matches, or when the scenario declares no precondition at
+    all. An unreadable world is reported as such rather than passed, so the
+    caller can refuse: saying "the precondition holds" about a world it never
+    read is the one answer that would be a lie.
     """
-    declared = scenario.starts_from.get("inventory")
-    if not isinstance(declared, dict):
+    # Both keys are read independently. This used to return early when no
+    # `inventory` was declared, which meant a scenario preconditions on the clock
+    # alone skipped its own precondition entirely - and skipped the world read
+    # that would have noticed. Found live: `survive-the-night` declares only
+    # `phase`, and `first-pickaxe` declares `phase: day` yet was measured at night
+    # because the phase was validated at load and then compared nowhere.
+    # A declared premise that checks nothing is worse than one that fails.
+    starts = scenario.starts_from
+    declared = starts.get("inventory")
+    declared_phase = starts.get("phase")
+    if not isinstance(declared, dict) and declared_phase is None:
         return None
     if facts is None:
         return "the world could not be read, so the scenario's starting condition is unchecked"
@@ -425,19 +433,39 @@ def start_mismatch(scenario: Scenario, facts: WorldFacts | None) -> str | None:
             + "; ".join(facts.unverified)
             + "), so the scenario's starting condition is unchecked"
         )
-    held = dict(sorted(facts.inventory.items()))
-    expected = dict(sorted(declared.items()))
-    if held == expected:
-        return None
-    wanted = ", ".join(f"{count}x {item}" for item, count in expected.items()) or "nothing"
-    actual = ", ".join(f"{count}x {item}" for item, count in held.items()) or "nothing"
-    return (
-        f"the world does not match this scenario's starting condition. "
-        f"scenario {scenario.name!r} declares: {wanted}. world holds: {actual}. "
-        "A scenario that cannot measure what it claims must not produce a number, "
-        "so either empty the bot's inventory or correct startsFrom.inventory to the "
-        "world as it actually is."
-    )
+    if isinstance(declared, dict):
+        held = dict(sorted(facts.inventory.items()))
+        expected = dict(sorted(declared.items()))
+        if held != expected:
+            wanted = ", ".join(f"{c}x {i}" for i, c in expected.items()) or "nothing"
+            actual = ", ".join(f"{c}x {i}" for i, c in held.items()) or "nothing"
+            return (
+                f"the world does not match this scenario's starting condition. "
+                f"scenario {scenario.name!r} declares: {wanted}. world holds: {actual}. "
+                "A scenario that cannot measure what it claims must not produce a "
+                "number, so either empty the bot's inventory or correct "
+                "startsFrom.inventory to the world as it actually is."
+            )
+    if declared_phase is not None:
+        have = facts.time_phase
+        if have != declared_phase:
+            # An absent phase is not a mismatched one, and the two want different
+            # words: outside the Overworld there is no daylight to disagree about,
+            # which is a different problem from the sun being on the wrong side.
+            if have is None:
+                detail = (
+                    "the clock reports no Overworld phase at all - either the bot is "
+                    "somewhere without daylight, or the read lost it"
+                )
+            else:
+                detail = f"the clock reads {have!r}"
+            return (
+                f"scenario {scenario.name!r} declares it starts at phase "
+                f"{declared_phase!r}, but {detail}. A scenario whose starting "
+                "condition does not hold is measuring a different question than the "
+                "one it names, so wait for the right phase or correct startsFrom.phase."
+            )
+    return None
 
 
 def _checks(raw: Any, source: str) -> tuple[Check, ...]:

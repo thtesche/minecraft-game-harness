@@ -265,6 +265,69 @@ def test_a_missing_scenario_file_is_named_rather_than_a_traceback():
     assert "could not be read" in str(caught.value)
 
 
+def test_a_declared_phase_is_compared_and_not_merely_validated(tmp_path):
+    """The premise must be checked, not just spelled correctly.
+
+    Found live on 2026-10-02: `startsFrom.phase` was accepted by the loader and
+    compared nowhere, so `first-pickaxe` - which declares `phase: day` - was
+    measured at night and produced a number. The key was validated at load, which
+    is what made it look enforced: the loader refused `phase: dusk` while
+    cheerfully ignoring `phase: day`.
+    """
+    scenario = loaded(tmp_path, {**MINIMAL, "startsFrom": {"phase": "day"}})
+    at_night = world_facts({**SITUATION, "clock": {**SITUATION["clock"], "phase": "night"}})
+    mismatch = start_mismatch(scenario, at_night)
+    assert mismatch is not None, "a declared phase that is not compared checks nothing"
+    assert "'day'" in mismatch and "'night'" in mismatch, "both sides must be readable"
+    assert scenario.name in mismatch
+
+    at_day = world_facts({**SITUATION, "clock": {**SITUATION["clock"], "phase": "day"}})
+    assert start_mismatch(scenario, at_day) is None
+
+
+def test_a_scenario_preconditioned_only_on_the_clock_still_reads_the_world(tmp_path):
+    """The old code returned early when no `inventory` was declared.
+
+    That skipped the whole precondition *and* the read that would have noticed, so
+    `survive-the-night` - which declares `phase: night` and nothing else - would
+    have reported its premise holding against a world it never looked at.
+    """
+    scenario = loaded(tmp_path, {**MINIMAL, "startsFrom": {"phase": "night"}})
+    assert scenario.starts_from.get("inventory") is None
+
+    at_night = world_facts({**SITUATION, "clock": {**SITUATION["clock"], "phase": "night"}})
+    assert start_mismatch(scenario, at_night) is None
+    assert start_mismatch(scenario, None) is not None, "an unreadable world is never a match"
+    assert "unchecked" in start_mismatch(scenario, None)
+
+
+def test_an_absent_phase_is_not_the_same_as_a_mismatched_one(tmp_path):
+    """Outside the Overworld there is no daylight, which is not the sun being wrong.
+
+    `clock.phase` is nullable by the server's own schema. Refusing to say "the sun
+    is on the wrong side" when the bot is in the Nether would name a cause that
+    isn't there, and the fix - wait for day - would never work.
+    """
+    scenario = loaded(tmp_path, {**MINIMAL, "startsFrom": {"phase": "night"}})
+    elsewhere = world_facts({**SITUATION, "dimension": "the_nether",
+                             "clock": {**SITUATION["clock"], "phase": None}})
+    mismatch = start_mismatch(scenario, elsewhere)
+    assert mismatch is not None
+    assert "no Overworld phase" in mismatch
+    assert "'night'" not in mismatch.split("but ")[1], "must not claim the clock read night"
+
+
+def test_a_scenario_with_no_precondition_still_passes_an_unreadable_world(tmp_path):
+    """Only a *declared* premise turns an unreadable world into a refusal.
+
+    Otherwise every scenario would need the world readable to be allowed to run,
+    which is a different and much noisier rule.
+    """
+    scenario = loaded(tmp_path, MINIMAL)
+    assert scenario.starts_from == {}
+    assert start_mismatch(scenario, None) is None
+
+
 def test_a_matching_starting_world_is_not_a_mismatch(tmp_path):
     scenario = loaded(tmp_path, {**MINIMAL, "startsFrom": {"inventory": {"dirt": 4}}})
     assert start_mismatch(scenario, world_facts({**SITUATION, "inventory": {
