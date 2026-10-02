@@ -28,7 +28,7 @@
     "min_confidence": null
   },
   "llm": {
-    "model": "",
+    "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
     "api_key_env": "OPENROUTER_API_KEY"
   }
 }

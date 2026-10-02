@@ -16,5 +16,11 @@ runs/
 # Local configuration, which carries endpoint URLs and never belongs in git.
 harness.config.json
 config.local.json
+
+# Secrets. .env.example is tracked on purpose; .env is not, and a key that
+# reaches a remote is rotated rather than removed from history.
+.env
+.env.*
+!.env.example
 # macOS
 .DS_Store

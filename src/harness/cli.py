@@ -3,7 +3,8 @@
 ``health``, ``state``, ``run-one`` and ``ledger`` are the Phase 0 surface, kept
 because they are how a skeleton is checked against a live world without running a
 whole plan. ``run-loop`` is Phase 1: a sequence of objectives, one trusted state
-read before each, which is where the harness stops being a smoke test.
+read before each, which is where the harness stops being a smoke test. With
+``--decider llm`` it is Phase 2: the model chooses each objective.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -20,6 +22,7 @@ from .config import Config
 from .decide import ScriptedDecider
 from .errors import BudgetExceeded, HarnessError, ObjectiveFailed
 from .ledger import Ledger
+from .llm import LlmError, LlmUsage, OpenRouterDecider, load_dotenv
 from .loop import INCOMPLETE_STOPS, RunLoop, StepReport
 from .mcp_client import McpClient
 from .objective import Objective, ObjectiveRunner
@@ -115,13 +118,20 @@ async def cmd_run_loop(args: argparse.Namespace) -> int:
     Phase 1's exit criterion: a multi-objective run where every ledger row
     carries the state the decision was made against.
 
-    The objectives come from ``--script``, a JSON list of ``{"tool", "arguments"}``
-    entries, which is the :class:`~harness.decide.ScriptedDecider` standing in for
-    a model. The seam is the deliverable; the script is the stand-in, and every row
-    it writes is marked ``source: "scripted"`` so a scripted run is never mistaken
-    for a model run.
+    The objectives come from one of two deciders:
+
+    ``--decider script`` replays ``--script``, a JSON list of
+    ``{"tool", "arguments"}`` entries, through
+    :class:`~harness.decide.ScriptedDecider`. Every row it writes is marked
+    ``source: "scripted"`` so a scripted run is never mistaken for a model run.
+
+    ``--decider llm`` asks the model named in ``llm.model`` on every decision,
+    through :class:`~harness.llm.OpenRouterDecider`. That is the Phase 2
+    baseline, and it is the run the later, cheaper deciders have to beat.
     """
     config = _config(args)
+    if args.decider == "llm":
+        return await _run_loop_with_model(config, args)
     if not args.script:
         print("run-loop needs --script; there is no model to choose objectives yet",
               file=sys.stderr)
@@ -167,6 +177,99 @@ async def cmd_run_loop(args: argparse.Namespace) -> int:
     if report.stop_reason in INCOMPLETE_STOPS:
         print(f"run stopped: {report.detail or report.stop_reason}", file=sys.stderr)
     return 0 if report.ok else 1
+
+
+async def _run_loop_with_model(config: Config, args: argparse.Namespace) -> int:
+    """`run-loop --decider llm`: a model chooses every objective.
+
+    The key is read from ``.env`` and then from the environment, with the
+    environment winning, and is never written anywhere. Everything that can go
+    wrong before the first decision - no key, no model named - is reported by
+    name here, because the alternative is an exception from inside a context
+    manager with a live ledger and a live Minecraft session attached.
+    """
+    load_dotenv()
+    if not config.llm.model:
+        print(
+            "llm.model is empty; set it in the config to an OpenRouter model id. "
+            "An empty model would be sent as a request with no model in it.",
+            file=sys.stderr,
+        )
+        return 78
+    if not os.environ.get(config.llm.api_key_env):
+        print(
+            f"{config.llm.api_key_env} is not set. Copy .env.example to .env, put "
+            f"the key in it, and export it; the key is read from the environment.",
+            file=sys.stderr,
+        )
+        return 78
+
+    with Ledger(config.ledger, config.run_id) as ledger:
+        async with McpClient(config.mcp) as client:
+            tools = await client.list_tools()
+            try:
+                decider = OpenRouterDecider(config.llm, tools)
+            except LlmError as error:
+                print(str(error), file=sys.stderr)
+                return 78
+            if decider.unreachable or decider.stale_read_controls:
+                # Both are facts about this harness, not the server, and both are
+                # otherwise invisible. An unreachable tool looks exactly like a
+                # tool the server does not have.
+                if decider.unreachable:
+                    print(
+                        f"note: {len(decider.unreachable)} advertised tool(s) advertise no "
+                        f"arguments and were kept from the model: {decider.unreachable}",
+                        file=sys.stderr,
+                    )
+                if decider.stale_read_controls:
+                    print(
+                        f"note: these read/control tools are excluded from decisions but "
+                        f"the server no longer advertises them, so the exclusion is dead "
+                        f"weight: {decider.stale_read_controls}",
+                        file=sys.stderr,
+                    )
+            loop = RunLoop(
+                StateReader(client),
+                ObjectiveRunner(client, config.mcp, config.budget, ledger),
+                decider,
+                ledger=ledger,
+                submission_prefix=config.mcp.submission_prefix or f"{config.run_id}-",
+                on_step=lambda step: _print_step(step),
+            )
+            report = await loop.run(max_steps=args.max_steps)
+
+    summary = report.summary()
+    usage = _usage_summary(decider.calls)
+    if usage:
+        summary["modelUsage"] = usage
+    print(json.dumps({**summary, "runId": config.run_id}, indent=2))
+    if report.stop_reason in INCOMPLETE_STOPS:
+        print(f"run stopped: {report.detail or report.stop_reason}", file=sys.stderr)
+    return 0 if report.ok else 1
+
+
+def _usage_summary(calls: list[LlmUsage]) -> dict[str, Any] | None:
+    """Aggregate the run's model cost.
+
+    This is the Phase 2 baseline measurement. Printing it at the end of the run
+    is what turns "we used a model" into a number a later decider can be measured
+    against.
+    """
+    if not calls:
+        return None
+    cost = sum(call.cost_usd or 0.0 for call in calls)
+    retried = sum(1 for call in calls if call.attempts > 1)
+    return {
+        "calls": len(calls),
+        "models": sorted({call.model for call in calls if call.model}),
+        "promptTokens": sum(call.prompt_tokens for call in calls),
+        "completionTokens": sum(call.completion_tokens for call in calls),
+        "reasoningTokens": sum(call.reasoning_tokens for call in calls),
+        "retriedCalls": retried,
+        "costUsd": round(cost, 6),
+        "costReported": any(call.cost_usd is not None for call in calls),
+    }
 
 
 def _print_step(step: StepReport) -> None:
@@ -236,6 +339,15 @@ def build_parser() -> argparse.ArgumentParser:
     run_loop.add_argument(
         "--script",
         help='JSON list of {"tool": ..., "arguments": {...}}, in order',
+    )
+    run_loop.add_argument(
+        "--decider",
+        choices=("script", "llm"),
+        default="script",
+        help=(
+            "script replays --script and records source=scripted; llm asks "
+            "llm.model on every decision and records source=openrouter:<model>"
+        ),
     )
     run_loop.add_argument(
         "--max-steps",
