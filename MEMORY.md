@@ -24,14 +24,58 @@ transcript rows):
 
 ## Current state
 
-Phase 0 committed and pushed at `1d3fe08`. 50 tests pass. Working tree was clean.
+Phase 0 is **live-verified** at `0d4bca7`. 78 tests pass, working tree clean.
 
 ```
 $ .venv/bin/python -m pytest -q
-50 passed in 2.93s
+78 passed in 3.82s
 ```
 
+Against a real Minecraft 1.21.4 host: `health` → 37 tools · `state` →
+trustworthy, `unverified: []` · `run-one collect_block` → `settled:succeeded`,
+`evidenceOk: true`, `polls: 16`, 41.6 s · `ledger` → `settled:succeeded` with a
+unique row id. The 41.6 s was spent waiting out a survival reflex that held the
+body — see D9.
+
 `mcp` SDK is **2.2.0**. Python 3.12 in `.venv` (uv-managed).
+
+## The lesson this session cost
+
+**A stand-in must be pinned to the server's contract, never to the client's
+assumptions.** `tests/fake_host.py` modelled `view_status` with the submission
+envelope and `tools` as `{"best": {...}}` — the two shapes the real host does
+*not* use. So the client and the fixture agreed, 50 tests passed, and
+`harness state` was broken live in two independent ways. A fake that encodes what
+the code under test happens to believe amplifies exactly the bug it exists to
+catch.
+
+Five defects surfaced only against the live world; all five passed the suite:
+
+| | Defect |
+|---|---|
+| 1 | `tools/list` is **2.91 MiB in one SSE event**; httpx2 caps at 1 MiB, the SDK hardcodes `EventSource(response)`, and swallows the error into a dead-socket message |
+| 2 | Two reply shapes in one session — 27 enveloped, 10 direct (`view_status` direct). One assumption → empty world reported as fact |
+| 3 | `situation.tools` is **one row per class**, not `{"best": …}`; live `tools.best` is null → crash |
+| 4 | `fake_host.py` encoded the client's assumptions, not the contract |
+| 5 | `ACTION_BUSY` with no action id (a survival reflex) was treated as terminal |
+
+## Live host facts, measured 2026-10-02
+
+- **Reply shapes.** Envelope: `{state, actionId, output}`. Direct:
+  `{action, durationMs, result, survival, survivalPolicy}`, no `state`.
+  27 foreground / 10 direct. `wait_for_action` is a *control* tool that still
+  speaks the envelope.
+- **`foreground` is not on the wire** — internal to `describe.ts:144`. Only
+  `submission_id` + `wait_timeout_ms` in the advertised schema hint at the split.
+- **Tool table**: `{"tools": [12 rows], "armour": [4 rows]}`, one row per class
+  whether or not held, empty ones carrying `tier: "none"`, `item: null`.
+- **Tier vocabulary** (`src/world/tool-tiers.ts:28`): `wooden stone iron golden
+  diamond netherite leather chainmail turtle other none`. Enum order is **not** a
+  ranking — armour materials sit after netherite, so the harness declares
+  Minecraft's own material order and reports anything outside it.
+- **Free body** = `activity.owner == "idle"` *and* `activeAction is null`
+  (`action-runner.ts`). Owners: `idle | foreground | yielding | takeover`.
+- `tools/list` = 3,054,268 bytes. `wait_for_action` outputSchema alone = 913 KB.
 
 ## Ground rules for this repo
 
@@ -67,6 +111,8 @@ contracts. Full reasoning in `docs/harness_idea.md` §5.
 | D6 | Laya runs at **objective** cadence, not tick cadence. The server stands still between actions; latency is not the constraint, **calibration** is. |
 | D7 | Deterministic server-side layers (recipe trees, frontier map, mobility) run before any model call. |
 | D8 | The long submit→wait→retrieve protocol stays a deterministic loop. The model is consulted at decision points *inside* it. |
+| D9 | `ACTION_BUSY` **with no `activeActionId`** is a survival reflex holding the body. Wait it out via `view_status`, bounded by `budget.gate_wait_ms`. Treating it as terminal aborted every objective for as long as a mob lived — most of the night. A status read that cannot be parsed is **not** read as freedom: that submits into a reflex and reports the refusal as an answer. |
+| D10 | `harness.sse` is the single sanctioned place that reaches into the SDK. A ceiling default chosen below a *measured* workload is a silent outage, so `MCMEASURED_TOOLS_LIST_BYTES` is a constant and the default is asserted above it in a test. |
 
 ## Laya operating limits
 
@@ -106,14 +152,23 @@ is exactly why they are code rather than prompt text.
 | `src/harness/ledger.py` | JSONL + SQLite, one row per decision, flushed per row. |
 | `src/harness/errors.py` | `UnverifiedRead` / `ProtocolError` / `ObjectiveFailed` / `BudgetExceeded`. |
 | `src/harness/cli.py` | `health`, `state`, `run-one`, `ledger`. |
+| `src/harness/sse.py` | The **only** module that patches the SDK. Raises if the SDK's call site moves; distinguishes "raise the ceiling" from "the patch stopped working". |
+
+`ToolReply` is deliberately **shape-aware**: `is_protocol`, `state` (which may be
+`None`), `require_state()`, and a `result` accessor that resolves the result
+object from either reply shape. A direct reply and an enveloped reply appear in
+the same session, so no call site may pick one.
+
+`tests/fake_host.py` now reproduces the **direct** reply shape, the row-per-class
+tool table, and the body-ownership refusal (`hostile.reflex`, `reflex_reads_left`).
 
 `StateVector` is deliberately small — a 4000-token state costs ~1.7 s on an Apple GPU and
 accuracy degrades past ~4k tokens. Shrinking the state is a design fix, not a bigger
 `max_len`.
 
-## Three SDK bugs the integration tests caught
+## Four SDK/contract bugs the integration tests caught
 
-Worth remembering because unit tests passed on all three and each would have failed
+Worth remembering because unit tests passed on all four and each would have failed
 against a live host at 3am:
 
 1. `streamable_http_client()` takes **no `timeout` kwarg** — it takes `http_client`. The
@@ -124,6 +179,12 @@ against a live host at 3am:
 
 Default SDK read timeout is **300 s**, shorter than one stack smelt, so the client
 builds its own via `create_mcp_http_client(timeout=...)`.
+
+4. `httpx2` caps one SSE event at **1 MiB** and the SDK constructs its parser as
+   `EventSource(response)` with no knob. The live host's `tools/list` is 2.91 MiB.
+   The SDK's `except Exception` around the event loop swallows httpx2's
+   `SSEError`, so the ceiling surfaces as a *dead socket*. Fixed in
+   `src/harness/sse.py`.
 
 ## One correctness subtlety
 
@@ -146,18 +207,29 @@ world outcome that a test then believes. It is not Minecraft.
 
 ## Verified this session
 
-CLI end to end against the fake host: `health` → tool count 3; `state` → trustworthy
-vector; `run-one collect_block` → `settled:succeeded`, `evidenceOk: true`, `polls: 0`;
-`ledger --counts` → one row.
+Live, against Minecraft 1.21.4 with the bot joined as `MineAI`: `health` → 37
+tools, SSE patch live · `state` → trustworthy, `unverified: []` · `run-one
+collect_block` → `settled:succeeded`, `evidenceOk: true`, `polls: 16` · `ledger`
+→ `settled:succeeded`, unique row ids.
+
+Also verified: the ceiling error path, by setting `max_sse_event_bytes` to
+1,000,000 and confirming the failure **names its cause** rather than reporting a
+dead socket.
 
 ## Not yet verified
 
-**Phase 0's live leg is unproven.** The exit criterion "one objective completes
-unattended, one ledger row exists" has only been met against the stand-in. No
-mine-ai-mcp host was running (`curl localhost:25575/health` empty). `mine-ai-mcp` is
-present and runnable at `/Users/thtesche/VibeCoding/mine-ai-mcp`.
+- **Death absorption.** The live run ended with the bot at 4.5 health under a
+  spider. It never died, so `lastDeath` handling is still unexercised. The
+  standing `lastDeath` in the live world (`shot by Skeleton`, 2026-09-30) is from
+  an earlier session, not this run.
+- **Long objectives.** Only `collect_block` has run. A smelt is the reason
+  `tool_timeout_ms` is an hour and nothing has yet exercised it.
+- **`state_hash` is never populated.** Every ledger row records an empty hash. It
+  is the key the `Memo` cache needs, so it must be filled from a real state read
+  before Phase 4 — and its absence is why the D10 memo figures cannot be
+  reproduced from harness data.
 
-Also unbuilt, and part of Phase 1's scope per `docs/architecture.md` §2.4 and §6:
+Still unbuilt, part of Phase 1 per `docs/architecture.md` §2.4 and §6:
 
 - cancellation
 - reconnection (re-read `/health.foreground`, reconnect)
@@ -171,18 +243,35 @@ Also unbuilt, and part of Phase 1's scope per `docs/architecture.md` §2.4 and �
 
 ## Next move
 
-1. **Verify Phase 0 live.** Start mine-ai-mcp, run `harness health` → `harness state` →
-   `harness run-one` against the real world, confirm a ledger row with verified evidence.
-2. **Phase 1.** The runner loop: several objectives in sequence, plus the missing
-   failure modes above. Exit criterion is a scripted multi-objective run with every
-   ledger row carrying verified evidence.
-3. **Resolve duplication against `laya-mine`** before building further — it already has a
+1. **Phase 1.** The runner loop: several objectives in sequence, plus the failure modes
+   above. Exit criterion is a scripted multi-objective run with every ledger row carrying
+   verified evidence. Start by reading the real state vector before each decision and
+   **stamping `state_hash`** — the loop is what makes the hash obtainable, and Phase 4's
+   memo cache needs it.
+2. **Resolve duplication against `laya-mine`** before building further — it already has a
    reflex dataset builder (`build_reflex_dataset.py`, 293 labelled rows in `reflex.jsonl`)
    and baseline measurements
    (`measurements/baseline-original-super120b.json`). Its rows predict *which survival
    directive the reflex should run*; the reflex is already deterministic server-side and
    needs no gating, so those rows answer a **different question** than the harness does.
    Reuse them as a baseline, or treat as a separate experiment — open question.
+3. **Fix the tool-advertisement bloat in mine-ai-mcp** (its own repo). `wait_for_action`'s
+   913 KB `outputSchema` is `$ref` inlining. Capping at the client is correct but only
+   treats the symptom; a 2.91 MiB handshake is a real cost on every session.
+
+## Running a live leg
+
+`mine-ai-mcp` needs `bun install` first (no `node_modules` in a fresh checkout):
+
+```sh
+cd /Users/thtesche/VibeCoding/mine-ai-mcp && bun install
+bun src/server/host.ts --minecraft-host 127.0.0.1 --minecraft-port 25565 \
+  --username MineAI --version 1.21.4
+```
+
+Then `harness health` is the reachability check. The host is spawned **per session**
+and does not survive a restart; `~/.mine-ai/bot-data` persists the frontier across
+runs, so a restart resumes rather than restarting.
 
 ## Related files elsewhere
 

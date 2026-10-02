@@ -5,9 +5,10 @@ A standalone application that plays Minecraft through
 [Laya](https://nandhakishorm.github.io/laya/) gating the decisions so that a frontier
 LLM is called far less often.
 
-> **Status: Phase 0 complete.** The skeleton connects, reads state, runs one objective
-> end to end, and records a ledger row. Verified against a faithful MCP stand-in rather
-> than only in unit tests — see [Running it](#running-it) and [Roadmap](#roadmap).
+> **Status: Phase 0 complete, verified live.** The skeleton connects, reads state, runs
+> one objective end to end, and records a ledger row — against a real Minecraft 1.21.4
+> world, not only a stand-in. That run found five defects the whole suite had passed; see
+> [Running it](#running-it) and [Roadmap](#roadmap).
 
 ## The problem
 
@@ -64,7 +65,7 @@ proceed — that is the difference between a measurement and an assumption.
 
 | Phase | Deliverable | Exit criterion | State |
 |---|---|---|---|
-| 0 — Skeleton | Connect, read status, run one objective, write a ledger row | One objective completes unattended, one ledger row exists | **done** |
+| 0 — Skeleton | Connect, read status, run one objective, write a ledger row | One objective completes unattended, one ledger row exists | **done, live-verified** |
 | 1 — Runner | The submit → wait → retrieve protocol state machine | A scripted multi-objective run, every row with verified evidence | protocol core in `objective.py`; loop not built |
 | 2 — Baseline | LLM on every decision, on a named scenario set | A measured calls-per-objective number | next |
 | 3 — Eval gate | ≥ 200 labelled decisions, `laya-evals`, temperature refit | A documented planner/gatekeeper/fine-tune decision | |
@@ -88,9 +89,29 @@ harness ledger --counts
 
 Start mine-ai-mcp first; `harness health` is the check that the host is reachable.
 
+```sh
+cd ../mine-ai-mcp && bun install          # a fresh checkout has no node_modules
+bun src/server/host.ts --minecraft-host 127.0.0.1 --minecraft-port 25565 \
+  --username MineAI --version 1.21.4
+```
+
 `harness state` exits non-zero when the vector is not trustworthy. That is deliberate: a
 section the contract promises but the reading did not find is reported, never replaced
 with a zero. An invented number is invisible, an escalation is not.
+
+### Two reply shapes, and why the live leg mattered
+
+The server answers in two shapes within one session: foreground tools return the
+submission envelope (`{state, actionId, output}`) and information tools return their
+result directly (`{action, durationMs, result, survival, survivalPolicy}`, no `state`).
+`view_status` is a direct tool. A client that assumes one shape reads nothing and reports
+an empty world as fact, so `ToolReply` resolves the result from either and insists on the
+envelope only where the protocol is required.
+
+The live host also advertises its 37 tools in a single 2.91 MiB server-sent event, which
+is over httpx2's 1 MiB ceiling — the SDK offers no way to raise it, and the resulting
+error reports itself as a dead socket. `src/harness/sse.py` is the one module that reaches
+into the SDK to bound it, and `harness health` reports whether that patch is in effect.
 
 ### Tests
 
@@ -109,6 +130,13 @@ three in the morning against a live world.
 
 It is a stand-in for the transport and the protocol, not for Minecraft. Nothing in it
 reports a physical world outcome that a test then believes.
+
+Worth stating plainly, because the live run proved it the hard way: **a stand-in has to
+be pinned to the server's contract, never to the client's assumptions.** This file once
+modelled `view_status` with the submission envelope and `tools` as `{"best": {...}}` —
+neither of which the real host uses. The client and the fixture therefore agreed, every
+test passed, and `harness state` was broken live in two independent ways. A fake that
+encodes what the code under test believes amplifies exactly the bug it exists to catch.
 
 ## A note on the numbers
 
