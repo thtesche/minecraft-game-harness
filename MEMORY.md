@@ -26,11 +26,12 @@ transcript rows):
 
 Phase 1 slice one is **live-verified** at `35302ae`; the Phase 2 model decider is
 live-verified at `df7af20`. The **goal list and scenario checker** are done and
-pushed at `7ac306a`/`dd2188a` — the mechanism, not a passing run. 233 tests pass.
+pushed at `7ac306a`/`dd2188a` — the mechanism, not a passing run. The **closed-connection
+diagnosis** was added at `dd2188a`'s successor after being found live. 237 tests pass.
 
 ```
 $ .venv/bin/python -m pytest -q
-233 passed in 4.20s
+237 passed in 4.16s
 ```
 
 Against a real Minecraft 1.21.4 host: `health` → 37 tools · `state` →
@@ -199,6 +200,8 @@ contracts. Full reasoning in `docs/harness_idea.md` §5.
 | D25 | **The per-goal cap counts attempts, not failures.** A long recipe is not a stuck loop; eight failed attempts at one goal and eight attempts at a goal that needs six steps are different things, and only the second is a cap. |
 | D26 | **A run-shaped check refuses to pass on a run that made no call.** `no_death`, `within_calls` and `evidence_verified` are universals over the set of steps, and over an empty set all three are vacuously true. Found by running scenario 1 live against a disconnected bot: the loop stopped correctly and two checks still printed green for a run in which the bot never moved. A check that passes on nothing has not passed. |
 | D27 | **Unreadable and unrankable are different, and the two consumers disagree on purpose.** `StateVector.unverified` holds both, because a decider that cannot rank what it is holding should be told so. `WorldFacts.unverified` holds only sections the harness could not parse; an equipment tier outside the harness order is a *warning*, because "is the best tool at least stone" is still answerable when the bot also holds a trident. Folding the two together would fail a passing run for a reason that is not the reason. |
+| D28 | **A closed Minecraft connection is a named stop, and the diagnosis is never guessed.** `runtime_unavailable`, in `INCOMPLETE_STOPS`, from `McpClient.bot_connected()` → `/health` → `minecraft.connected`. Asked on the **first** unverified read only: a closed socket cannot be read better by asking again (measured live, `unverifiedReads` 3 → 1), but one bad read is a blip and calling it a dead bot is a confident wrong answer. `bot_connected()` returns `None` — never `False` — when `/health` is unreadable, has no `minecraft` key, or holds a non-boolean, and `None` falls back to `unverified_state` with retries intact. Naming a cause when it is known beats reporting a parse failure; *guessing* one would be worse than either. Recovery is still unbuilt: there is no reconnect to drive. |
+| D29 | **`/health`'s status code is not an error.** `src/server/http.ts:90` answers **503** with `ok: false` and the reason in the body when the bot is disconnected, so `raise_for_status()` broke the one command a person runs to diagnose a disconnection — measured: `harness health` died with an `HTTPStatusError` traceback. The body is the answer; only a body that is not JSON is an error. |
 
 ## Laya operating limits
 
@@ -419,6 +422,17 @@ memory, and the wire is `mine-ai-mcp/src/actions/view-status/contract.ts`
   only the shape was checked, not the presence. Now `unverified`, so a broken read
   cannot become a red run that looks like a bot that failed.
 
+**And two more from chasing the diagnosis** (D28, D29): `harness health` tracebacked
+because `raise_for_status()` rejected the 503 that `/health` returns *by design* when
+the bot is disconnected, and the loop reported `unverified_state` after three reads —
+true, and useless, since nobody can fix a parse failure. Both fixed; the run now says
+`runtime_unavailable` after **one** read and names who has to act.
+
+**Live verification of the refusal path is the one thing this run did establish**, and
+it is worth more than a green run would have been: against a world it could not read,
+the harness produced four red checks, no vacuous passes, a named stop reason, and a
+message naming the operator action — with zero objectives submitted into a reflex.
+
 ## Not yet verified
 
 - **Scenario 1 passing, live.** Never run against a bot that was connected. The
@@ -441,8 +455,10 @@ Still unbuilt, part of Phase 1 per `docs/architecture.md` §2.4 and §6:
 
 - a Laya-backed decider (the `Decider` seam is done and filled by the model one)
 - cancellation
-- reconnection (re-read `/health.foreground`, reconnect) — `RUNTIME_UNAVAILABLE`
-  currently stops the run
+- reconnection (`RUNTIME_UNAVAILABLE`) — the **detection** half is built and
+  live-verified as `runtime_unavailable` (D28); the **recovery** half is not, and
+  cannot be: `mine-ai-mcp` has no reconnect to drive, so recovery means a service
+  restart by the operator. Nothing to implement unless the server grows one.
 - `SUBMISSION_CONFLICT` recovery — deliberately **not** built; see D15
 
 ## Next move
@@ -463,13 +479,14 @@ Still unbuilt, part of Phase 1 per `docs/architecture.md` §2.4 and §6:
    is prompt + world + checker (D19); the checker is written first. Note D18: the
    goal is an item name and `craft_item` does the decomposition, so there is no
    planner call and no recipe knowledge in the harness.
-2. **Cancellation and reconnection.** The decider seam is filled — `ScriptedDecider`
-   and `OpenRouterDecider` both work — so what is left of Phase 1 slice two is
-   `cancel_foreground_action` and `RUNTIME_UNAVAILABLE` recovery (re-read
-   `/health.foreground`, reconnect). Note the baseline's shape when judging them:
-   **20–37 s per decision**, so a cancelled objective wastes real money, not just
-   time. The reference run's shape says the same thing louder: **59 of its 388 calls
-   were `wait_for_action`**, 15.2% of a $93 run spent polling.
+2. **Cancellation, and the recovery half of reconnection.** The decider seam is
+   filled — `ScriptedDecider` and `OpenRouterDecider` both work — so what is left of
+   Phase 1 slice two is `cancel_foreground_action`; reconnection's *detection* is done
+   (D28) and its recovery is not buildable, because the server offers no reconnect to
+   drive. Note the baseline's shape when judging cancellation: **20–37 s per
+   decision**, so a cancelled objective wastes real money, not just time. The
+   reference run's shape says the same thing louder: **59 of its 388 calls were
+   `wait_for_action`**, 15.2% of a $93 run spent polling.
 3. **Then: survive one night** (time-bounded, cheap, and it finally exercises **death
    absorption live**, unverified across three sessions), and **stone tier** (both its
    items come back `missing_materials` naming `cobbled_deepslatex`).

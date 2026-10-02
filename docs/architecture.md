@@ -289,8 +289,20 @@ ledger row. Own process, config file, no chat session.
 ### Phase 1 — The runner
 
 The protocol state machine of §2.4, complete: bounded waits, `RESULT_NOT_RETRIEVED`,
-`ACTION_BUSY`, `SUBMISSION_CONFLICT`, cancellation, reconnection, evidence
-verification, death absorption. Multiple objectives in sequence.
+`ACTION_BUSY`, `SUBMISSION_CONFLICT`, cancellation, evidence verification, death
+absorption. Multiple objectives in sequence.
+
+Two of these are named omissions rather than gaps. **`SUBMISSION_CONFLICT` has no
+recovery** (D15): the refusal names no action, so the submission holding that id cannot
+be found and may still be running. **Reconnection has detection but no recovery** (D28):
+`runtime_unavailable` reads `/health` and stops, because
+`mine-ai-mcp/src/server/runtime-host.ts:143` states that "a new Minecraft connection
+requires an explicit service restart" — there is no reconnect for the harness to drive.
+An unbuildable half is recorded as unbuildable rather than stubbed to look finished.
+
+`cancellation` (`cancel_foreground_action`) is the one item in this phase still
+unbuilt, and it is worth real money rather than just time: a decision costs 20–37 s
+and a cancelled objective wastes it.
 
 **Exit:** a scripted multi-objective run completes with every ledger row carrying
 verified evidence. **This phase is the harness.** Phases 2–4 are an optimisation
