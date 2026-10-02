@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 from conftest import FakeClient, settled, situation, status
+from fake_host import run_host
 
 from harness.config import BudgetConfig, McpConfig
 from harness.decide import (
@@ -21,6 +22,7 @@ from harness.decide import (
     confidence_gate,
 )
 from harness.ledger import Ledger
+from harness.mcp_client import McpClient
 from harness.loop import (
     STOP_ESCALATED,
     STOP_PLAN_EXHAUSTED,
@@ -329,7 +331,7 @@ async def test_a_scripted_decider_reports_what_is_left_and_rewinds():
 async def test_a_script_names_arguments_from_the_advertised_schema():
     tools = [{
         "name": TOOL,
-        "inputSchema": {"properties": {"block_type": {"type": "string"}}, "required": ["block_type"]},
+        "input_schema": {"properties": {"block_type": {"type": "string"}}, "required": ["block_type"]},
     }]
     decider = ScriptedDecider([(TOOL, {"blocks": "dirt"})], tools)
 
@@ -340,8 +342,42 @@ async def test_a_script_names_arguments_from_the_advertised_schema():
     assert "blocks" in str(caught.value)
 
 
+async def test_the_guard_reads_the_spelling_a_server_actually_publishes():
+    """mine-ai-mcp publishes ``input_schema``, not the specified ``inputSchema``.
+
+    These two tests once used ``inputSchema``, so the guard passed while reading
+    a key no server in this project sends. Against the live host it therefore
+    never ran, and ``block_typo`` was accepted on ``collect_block``. Both
+    spellings are read; this one pins the one that actually occurs.
+    """
+    for key in ("input_schema", "inputSchema"):
+        decider = ScriptedDecider(
+            [(TOOL, {"blocks": "dirt"})],
+            [{"name": TOOL, key: {"properties": {"block_type": {"type": "string"}}}}],
+        )
+        with pytest.raises(ScriptedArgumentError):
+            await decider.propose(StateVector(), step=0)
+
+
+async def test_the_guard_fires_on_an_advertisement_from_a_real_server():
+    """The shape under test, taken from an actual ``tools/list`` round trip.
+
+    A hand-written fixture states what the author believes the server sends. A
+    read off the wire states what it does, and the two have differed here.
+    """
+    async with run_host() as (host, url, health_url):
+        client = McpClient(McpConfig(url=url, health_url=health_url))
+        async with client:
+            tools = await client.list_tools()
+
+    decider = ScriptedDecider([("collect_block", {"block_typo": "dirt"})], tools)
+    with pytest.raises(ScriptedArgumentError) as caught:
+        await decider.propose(StateVector(), step=0)
+    assert "block_typo" in str(caught.value)
+
+
 async def test_a_correct_argument_name_passes():
-    tools = [{"name": TOOL, "inputSchema": {"properties": {"block_type": {"type": "string"}}}}]
+    tools = [{"name": TOOL, "input_schema": {"properties": {"block_type": {"type": "string"}}}}]
     decider = ScriptedDecider([(TOOL, {"block_type": "dirt"})], tools)
 
     answer = await decider.propose(StateVector(), step=0)

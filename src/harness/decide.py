@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol, Sequence, runtime_checkable
 
+from .mcp_client import argument_names
 from .state import StateVector
 
 
@@ -166,15 +167,16 @@ class ScriptedDecider:
         and records it honestly. This only catches the class of error the server
         cannot see, because a wrong argument name is dropped or coerced rather
         than refused.
+
+        Reads the schema through :func:`~harness.mcp_client.argument_names`,
+        which accepts both ``input_schema`` and ``inputSchema``. This method used
+        to read ``inputSchema`` alone, which mine-ai-mcp does not publish - so
+        against the live host the check never ran and any argument name passed.
         """
-        advertised = self._tools.get(tool)
-        if advertised is None:
+        properties = argument_names(self._tools.get(tool))
+        if not properties:
             return
-        schema = advertised.get("inputSchema")
-        properties = schema.get("properties") if isinstance(schema, dict) else None
-        if not isinstance(properties, dict):
-            return
-        unknown = sorted(set(arguments) - set(properties))
+        unknown = sorted(set(arguments) - properties)
         if unknown:
             raise ScriptedArgumentError(
                 f"{tool} accepts {sorted(properties)}, not {unknown}; a wrong "

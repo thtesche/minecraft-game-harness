@@ -126,6 +126,36 @@ class ToolReply:
         return status if isinstance(status, str) else None
 
 
+#: The two spellings an MCP ``tools/list`` entry has used for its input schema.
+#: The specification says ``inputSchema``; mine-ai-mcp publishes ``input_schema``.
+#: Both are read because reading only one silently disables every check that
+#: depends on it - the argument guard accepted ``block_typo`` against the live
+#: host for exactly this reason, while a test feeding it ``inputSchema`` stayed
+#: green. A check that no longer runs looks identical to a check that passes.
+_INPUT_SCHEMA_KEYS = ("input_schema", "inputSchema")
+
+
+def input_schema_of(tool: dict[str, Any] | None) -> dict[str, Any]:
+    """The input schema a tool advertises, under whichever key it uses.
+
+    Returns ``{}`` when there is none, so a caller can ask for ``properties``
+    without first proving the schema is there.
+    """
+    if not isinstance(tool, dict):
+        return {}
+    for key in _INPUT_SCHEMA_KEYS:
+        schema = tool.get(key)
+        if isinstance(schema, dict):
+            return schema
+    return {}
+
+
+def argument_names(tool: dict[str, Any] | None) -> set[str]:
+    """Argument names the advertisement accepts, empty if it says nothing."""
+    properties = input_schema_of(tool).get("properties")
+    return set(properties) if isinstance(properties, dict) else set()
+
+
 class McpClient:
     """Connection to one mine-ai-mcp host."""
 
