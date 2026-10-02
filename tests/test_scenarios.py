@@ -530,8 +530,34 @@ def test_within_calls_without_a_sane_budget_fails(budget):
 def test_no_death_uses_the_run_not_the_world():
     """A death from a previous run must not fail this one."""
     facts = world_facts(SITUATION)  # the world carries a lastDeath
-    assert run(Check("no_death", {}), facts).passed
-    assert not run(Check("no_death", {}), facts, deaths=1).passed
+    assert run(Check("no_death", {}), facts, steps=[a_step(0)]).passed
+    assert not run(Check("no_death", {}), facts, steps=[a_step(0)], deaths=1).passed
+
+
+def test_no_run_shaped_check_passes_on_a_run_that_did_nothing():
+    """"Never died" over zero steps is an empty set, not a clean run.
+
+    Every one of these would read green on a loop that stopped at the first
+    unreadable world, which is the failure this repo cares about most: a check
+    that passes on nothing has not passed.
+    """
+    for kind in ("no_death", "within_calls", "evidence_verified"):
+        verdict = run(Check(kind, {"calls": 8}), None)
+        assert not verdict.passed, kind
+        assert "made no tool call" in verdict.detail, kind
+
+
+def test_a_step_that_ran_is_enough_for_the_run_shaped_checks():
+    """The guard is about an empty run, not about failures inside a real one.
+
+    One failed step is still a run. `no_death` and `within_calls` then answer
+    normally - a failure is not a death, and one call is within eight - while
+    `evidence_verified` still fails, because that objective carried no evidence.
+    """
+    for kind, expected in (("no_death", True), ("within_calls", True), ("evidence_verified", False)):
+        verdict = run(Check(kind, {"calls": 8}), None, steps=[a_step(0, ok=False, evidence=False)])
+        assert verdict.passed is expected, (kind, verdict.detail)
+        assert "made no tool call" not in verdict.detail, kind
 
 
 def test_evidence_verified_notices_a_settled_step_with_no_evidence():

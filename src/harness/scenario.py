@@ -353,6 +353,29 @@ def _note(context: CheckContext, detail: str) -> str:
     return f"{detail} (could not rank: {'; '.join(context.facts.warnings)})"
 
 
+def _needs_run(context: CheckContext, kind: str) -> Verdict | None:
+    """A verdict for a run-shaped check on a run that did nothing.
+
+    Every run-shaped check is a statement about a set of steps - "every settled
+    objective carried evidence", "no step died", "the run used at most N calls".
+    On a run with no steps all three are vacuously true, and a check that passes
+    on nothing is the same failure as a check that stopped running: the report
+    shows three green lines for a run in which the bot never moved. So a
+    universal over the empty set is reported as unmeasured, not satisfied.
+
+    ``holds_item`` and friends do not need this. They are statements about the
+    world, and an empty world genuinely fails them.
+    """
+    if not context.loop.steps:
+        return Verdict(
+            kind=kind,
+            passed=False,
+            detail=f"the run made no tool call, so {kind} has nothing to "
+            "measure; a check that passes on nothing has not passed",
+        )
+    return None
+
+
 def check_holds_item(context: CheckContext) -> Verdict:
     unavailable = _needs_world(context)
     if unavailable is not None:
@@ -412,6 +435,9 @@ def check_no_death(context: CheckContext) -> Verdict:
     still leaves a ``lastDeath`` in the world, and grading this run on a death
     from a previous one would fail a run for something it did not do.
     """
+    unused = _needs_run(context, "no_death")
+    if unused is not None:
+        return unused
     absorbed = context.loop.deaths_absorbed
     return Verdict(
         "no_death",
@@ -427,6 +453,9 @@ def check_within_calls(context: CheckContext) -> Verdict:
     empty inventory in four tool calls, two of them reads; a budget is how this
     baseline gets read against that rather than merely admired.
     """
+    unused = _needs_run(context, "within_calls")
+    if unused is not None:
+        return unused
     budget = context.params.get("calls")
     if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
         return Verdict("within_calls", False, f"within_calls needs a positive integer `calls`, got {budget!r}")
@@ -444,6 +473,9 @@ def check_evidence_verified(context: CheckContext) -> Verdict:
     A harness check rather than a world check: acceptance is not a physical
     result, and a run that "succeeded" without evidence has measured nothing.
     """
+    unused = _needs_run(context, "evidence_verified")
+    if unused is not None:
+        return unused
     steps = context.loop.steps
     settled = [s for s in steps if s.result is not None and s.result.state == "settled"]
     missing = [s.index for s in settled if not s.result.evidence_ok]
