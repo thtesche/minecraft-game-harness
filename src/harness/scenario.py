@@ -196,6 +196,11 @@ class ScenarioReport:
     usage: dict[str, Any] | None = None
     run_id: str = ""
     reference: dict[str, Any] = field(default_factory=dict)
+    #: The starting condition the run was actually held to, and the scenario's
+    #: reason for existing. Both are facts about *this* run rather than about the
+    #: checker, and without them the numbers above cannot be compared to anything.
+    why: tuple[str, ...] = ()
+    started_from: dict[str, Any] = field(default_factory=dict)
 
     @property
     def passed(self) -> bool:
@@ -216,6 +221,10 @@ class ScenarioReport:
         }
         if self.usage:
             out["modelUsage"] = self.usage
+        if self.why:
+            out["why"] = list(self.why)
+        if self.started_from:
+            out["startedFrom"] = self.started_from
         if self.reference:
             out["reference"] = self.reference
         return out
@@ -248,6 +257,25 @@ class Scenario:
     #: so the scenario is corrected against reality rather than reality quietly
     #: edited to fit.
     starts_from: dict[str, Any] = field(default_factory=dict)
+    #: Why this scenario is in the set, as separate sentences. Carried into the
+    #: report rather than left in the JSON, because the question a baseline has
+    #: to answer is not "what did it score" but "what was it measuring" - and a
+    #: reader who has to open the scenario file to learn that has no baseline.
+    #: Distinct from ``reference``, which is a run to compare against; this is
+    #: the reason to look.
+    why: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Validated here rather than only in ``load``, because a check that only
+        # one construction path applies is not a check: a ``Scenario`` built in a
+        # test or a future caller would carry a premise nothing ever enforced, and
+        # the run against it would quietly measure the wrong thing.
+        _check_starts_from(self.starts_from, self.name or "<unnamed scenario>")
+        if isinstance(self.why, str):
+            raise ScenarioError(
+                f"{self.name or '<unnamed scenario>'}: why must be a list of sentences, "
+                "not one string - a single blob is a paragraph nobody reads"
+            )
 
     def __post_init__(self) -> None:
         # Validated here rather than only in ``load``, because a check that only
@@ -273,7 +301,8 @@ class Scenario:
         if not isinstance(raw, dict):
             raise ScenarioError(f"{scenario_path}: expected an object, got {type(raw).__name__}")
 
-        known = {"name", "prompt", "goals", "checks", "maxSteps", "reference", "startsFrom"}
+        known = {"name", "prompt", "goals", "checks", "maxSteps", "reference",
+                 "startsFrom", "why"}
         unknown = set(raw) - known
         if unknown:
             raise ScenarioError(
@@ -302,8 +331,17 @@ class Scenario:
             raise ScenarioError(
                 f"{scenario_path}: startsFrom must be an object, got {type(starts_from).__name__}"
             )
+        # `[]` and not `()`: the default has to satisfy the same check the input
+        # does, or an absent key would be refused while a present one passed.
+        why = raw.get("why", [])
+        if isinstance(why, str) or not isinstance(why, list) or not all(
+            isinstance(line, str) and line.strip() for line in why
+        ):
+            raise ScenarioError(
+                f"{scenario_path}: why must be a list of non-empty strings, got {why!r}"
+            )
         _check_starts_from(starts_from, str(scenario_path))
-        return cls(  # __post_init__ checks starts_from again, by design: see there.
+        return cls(  # __post_init__ checks starts_from and why again, by design: see there.
             name=name.strip(),
             goals=goals,
             checks=checks,
@@ -311,12 +349,22 @@ class Scenario:
             max_steps=max_steps,
             reference=reference,
             starts_from=starts_from,
+            why=tuple(why),
         )
 
 
-#: Keys ``startsFrom`` accepts. ``inventory`` is the one that is enforced; ``note``
-#: is prose for the reader and is carried into the report unparsed.
-STARTS_FROM_KEYS = frozenset({"inventory", "note"})
+#: Keys ``startsFrom`` accepts. ``inventory`` and ``phase`` are the two that are
+#: enforced; ``note`` is prose for the reader and is carried into the report
+#: unparsed.
+STARTS_FROM_KEYS = frozenset({"inventory", "phase", "note"})
+
+#: The Overworld daylight phases, from the server's own clock schema
+#: (``z.enum(["day", "night"]).nullable()`` in view-status/contract.ts). Listed
+#: rather than invented so a typo names the two real values. ``null`` is a *reading*
+#: - outside the Overworld there is no daylight - so it is never a legal
+#: precondition: "survive the night" in the Nether is an undefined question, and
+#: refusing to express it is more honest than a check that can never pass.
+CLOCK_PHASES = ("day", "night")
 
 
 def _check_starts_from(starts_from: dict[str, Any], source: str) -> None:
@@ -332,6 +380,12 @@ def _check_starts_from(starts_from: dict[str, Any], source: str) -> None:
             f"{source}: startsFrom unknown keys {sorted(unknown)}; expected "
             f"{sorted(STARTS_FROM_KEYS)}. A typo'd key here would check nothing at all, "
             "which is the premise vanishing rather than failing."
+        )
+    if "phase" in starts_from and starts_from["phase"] not in CLOCK_PHASES:
+        raise ScenarioError(
+            f"{source}: startsFrom.phase must be one of {list(CLOCK_PHASES)}, got "
+            f"{starts_from['phase']!r}. The server reports the Overworld phase as day or "
+            "night, and null where there is no daylight at all."
         )
     if "inventory" not in starts_from:
         return

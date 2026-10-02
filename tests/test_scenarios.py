@@ -325,6 +325,16 @@ def test_a_starting_count_of_zero_is_refused():
         Scenario("x", GoalSet(()), (), starts_from={"inventory": {"dirt": 0}})
 
 
+def test_why_must_be_a_list_of_sentences(tmp_path):
+    """A single blob is a paragraph nobody reads; a bare string would be one."""
+    ok = loaded(tmp_path, {**MINIMAL, "why": ["it is the cheapest thing that can fail"]})
+    assert ok.why == ("it is the cheapest thing that can fail",)
+    assert loaded(tmp_path, MINIMAL).why == (), "absent is allowed and means nothing to say"
+    for bad in ("because", ["ok", ""], [1], {"a": "b"}):
+        with pytest.raises(ScenarioError):
+            Scenario.load(scenario_file(tmp_path, {**MINIMAL, "why": bad}))
+
+
 def test_the_shipped_scenarios_parse():
     """The files in `scenarios/` are what the exit criterion is measured on."""
     from pathlib import Path
@@ -336,6 +346,10 @@ def test_the_shipped_scenarios_parse():
         scenario = Scenario.load(path)
         assert scenario.checks, f"{path.name} has no checks"
         assert scenario.goals.goals
+        assert scenario.why, (
+            f"{path.name} says what it scores but not what it measures; the reader's "
+            "first question about a baseline is what the number is a number of"
+        )
 
 
 def test_the_first_scenario_records_the_reference_numbers():

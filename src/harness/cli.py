@@ -306,7 +306,8 @@ async def cmd_run_scenario(args: argparse.Namespace) -> int:
             # starts, not reported after: a run whose starting inventory did not
             # match produces a number that looks fine and is not comparable to
             # anything. Refusing here spends one read and no objectives.
-            start = start_mismatch(scenario, await _world_facts(client))
+            before = await _world_facts(client)
+            start = start_mismatch(scenario, before)
             if start is not None:
                 print(f"scenario refused before the run: {start}", file=sys.stderr)
                 return 64
@@ -330,6 +331,8 @@ async def cmd_run_scenario(args: argparse.Namespace) -> int:
         usage=_usage_summary(getattr(decider, "calls", [])),
         run_id=config.run_id,
         reference=scenario.reference,
+        why=scenario.why,
+        started_from=_start_summary(before),
     )
     print(json.dumps(result.summary(), indent=2))
     print(format_report(result), file=sys.stderr)
@@ -338,6 +341,27 @@ async def cmd_run_scenario(args: argparse.Namespace) -> int:
     # 0 only when the run finished cleanly *and* every check passed, so a
     # scenario suite can be run unattended and a red check is a red exit code.
     return 0 if result.passed else 1
+
+
+def _start_summary(facts: WorldFacts | None) -> dict[str, Any]:
+    """What the world actually looked like when the run began.
+
+    Recorded rather than assumed: the precondition says the run *would* refuse on
+    a mismatch, so anything here was either checked against ``startsFrom`` or the
+    scenario declared no precondition. Either way the number belongs in the
+    report, because ``within_calls`` is meaningless without the state it started
+    from.
+    """
+    if facts is None:
+        return {"read": "the world could not be read before the run"}
+    out: dict[str, Any] = {
+        "inventory": dict(sorted(facts.inventory.items())),
+        "phase": facts.time_phase,
+        "bestTool": facts.best_tool,
+    }
+    if facts.unverified:
+        out["unverified"] = list(facts.unverified)
+    return out
 
 
 def _check_llm_prereqs(config: Config) -> int:

@@ -1,0 +1,28 @@
+{
+  "name": "survive-the-night",
+  "prompt": "Stay alive until morning. Night is coming. Come out of it alive and in daylight.",
+  "goals": [
+    "survive_until_morning"
+  ],
+  "checks": [
+    { "kind": "time_phase_is", "phase": "day" },
+    { "kind": "no_death" },
+    { "kind": "evidence_verified" },
+    { "kind": "goal_succeeded" }
+  ],
+  "maxSteps": 24,
+  "startsFrom": {
+    "phase": "night",
+    "note": "PLACEHOLDER: no `inventory` key, because the world cannot be read at the phase this scenario needs - the clock is currently day, and holding the night until it is night is not this scenario's job. So this scenario declares only the precondition it can state truthfully, and the run it produces is NOT comparable to another run until the starting inventory is recorded here from a live read. The suite will therefore run this file and report it, but the number should not be quoted until then. Recorded and deliberately not guessed: the world's inventory changes as soon as anything is picked up, and an invented starting condition is a premise that measures itself."
+  },
+  "why": [
+    "It is the cheapest scenario that can still go wrong. A night is about eight minutes of game time and the failure modes are mobs, falling, and the survival reflex holding the body - none of which need a craft chain to express.",
+    "It is the first scenario that can exercise death absorption live, which has been tested against the fake only for three sessions. A death mid-run leaves a lastDeath in the world, so no_death is answered from the run's absorbed count rather than from the world's lastDeath: grading this on a death from a previous run would fail a run for something it did not do.",
+    "It is the only scenario where the decider's cadence is not the bottleneck. The run has to wait out real time, which is exactly the regime where the reference's polling cost shows up - 59 of its 388 calls were wait_for_action, 15.2% of a $93 run spent waiting.",
+    "Eating is not this scenario's job. survivalPolicy.defaults has food.raw.allow at emergency_only (hunger_at_most 6, health_below 10), so the server eats for the bot when it is nearly starving; gathering and cooking is the model's, and this scenario deliberately does not require it."
+  ],
+  "reference": {
+    "source": "aibengineering/beat-the-game-minecraft (claude-opus-5[1m], effort high)",
+    "note": "No per-scenario number is quoted for this one, and none is estimated. The reference's night is not separable from its 3:56:35, and inventing a comparable figure for the one scenario where the answer is unknown would make the whole baseline unreadable. What is comparable is structural: D9 exists because a single ACTION_BUSY with no activeActionId held its body for most of a night."
+  }
+}

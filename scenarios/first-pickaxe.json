@@ -1,6 +1,6 @@
 {
   "name": "first-pickaxe",
-  "prompt": "Reach a wooden pickaxe and end holding it.",
+  "prompt": "Start with nothing and end holding a wooden pickaxe.",
   "goals": [
     "wooden_pickaxe"
   ],
@@ -11,9 +11,15 @@
     { "kind": "within_calls", "calls": 8 }
   ],
   "maxSteps": 16,
+  "why": [
+    "It is the make-or-break for goal-list mode. If a model given an unordered list of one goal cannot get from an empty inventory to a held wooden pickaxe, the decomposition story is wrong and the rest of the set is wasted effort.",
+    "It is the only scenario whose reference number is separable. The reference run did this in 4 tool calls, 2 of them reads, so the like-for-like figure is 2 objective submissions - small enough that a budget of 8 is a real constraint and not a formality.",
+    "craft_item returns the whole recipe tree in its result, so reaching the pickaxe also measures whether the model reads the tree and gathers the leaves rather than guessing at a recipe. That is D18 under test: no planner call, and no recipe knowledge in the harness."
+  ],
   "startsFrom": {
-    "inventory": { "dirt": 4, "oak_log": 1, "acacia_log": 3 },
-    "note": "Not literally nothing. The bot rejoined this world holding 4 dirt and 4 logs, and the user chose to keep the world and record the real starting state rather than regenerate it. So the premise is 'no tools and no crafting table, but some logs already in hand' - not 'empty inventory'. 4 logs is roughly a quarter of what a wooden pickaxe needs, so this is a slightly easier question than the reference's, and the reference's own number is below this budget either way (2 objective submissions). The prompt deliberately does not claim an empty inventory: the model is shown the real state vector, so a prompt asserting otherwise would contradict what it reads."
+    "inventory": {},
+    "phase": "day",
+    "note": "An empty map is the assertion 'holds nothing', and it is checked against a live read before the loop starts - omission is how a stack is declared absent, so this is exact, not 'at least nothing'. Recorded from the world on 2026-10-02 after restarting the host: inventory.used 0, carried [], best_tool null, clock day, unverified []. The premise came out better than expected. The bot had been holding 4 dirt and 4 logs, which would have made this a slightly easier question than the reference's, but it died to a Zombie at 15:12:32 while the host was down and dropped everything, so it respawned at (-50.5, 71, -0.5) with empty hands. That makes the run exactly like-for-like with the reference, which also started from an empty inventory. lastDeath is set in this world, which scenario 1 does not care about and scenario 2 must not be graded against."
   },
   "reference": {
     "source": "aibengineering/beat-the-game-minecraft (claude-opus-5[1m], effort high)",
