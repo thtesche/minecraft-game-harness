@@ -16,17 +16,61 @@ reimplements the protocol rules from the server's contract:
 
 It is a stand-in for the transport and the protocol, not for Minecraft. Nothing
 here reports a physical world outcome that a test then believes.
+
+Two reply shapes
+----------------
+
+The server answers in two shapes, in the same session, and the difference is not
+cosmetic:
+
+* **foreground** tools get the submission envelope -
+  ``{state, actionId, output}``
+* **information and control** tools answer directly -
+  ``{action, durationMs, result, survival, survivalPolicy}``, with no ``state``
+
+``view_status`` is a direct tool. This file once wrapped it in the envelope, and
+because the client was written against this file, every test agreed with the
+client and both were wrong: ``harness state`` reported an empty world against
+the live host while the suite stayed green. A stand-in has to be pinned to the
+*server's* contract, never to the client's current assumptions - otherwise it
+amplifies exactly the bug it exists to catch.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import socket
 from dataclasses import dataclass, field
 from typing import Any
 
 import uvicorn
+
+def _tool_row(kind: str, tier: str = "none", item: str | None = None) -> dict[str, Any]:
+    """One row of the server's tool table.
+
+    ``situation.tools`` carries one row per class - twelve tool classes, four
+    armour pieces - whether or not anything is held, with ``tier: "none"`` and a
+    null ``item`` when the slot is empty. This fixture once published
+    ``{"best": {"name": ..., "tier": ...}}``, a shape the server does not use,
+    which is how a null ``tools.best`` reached ``_best_tier`` and crashed
+    ``harness state`` against a live host while every test stayed green.
+    """
+    return {
+        "class": kind,
+        "tier": tier,
+        "item": item,
+        "slot": None if item is None else 36,
+        "durabilityLeft": None if item is None else 100,
+        "maximumDurability": None if item is None else 250,
+    }
+
+
+#: The twelve tool classes and four armour pieces the server always publishes.
+TOOL_CLASSES = ("pickaxe", "shovel", "axe", "sword", "hoe", "shears", "bow",
+                "shield", "bucket", "water_bucket", "lava_bucket", "powder_snow_bucket")
+ARMOUR_CLASSES = ("helmet", "chestplate", "leggings", "boots")
 
 SITUATION: dict[str, Any] = {
     "vitals": {"health": 20.0, "food": 18.0, "saturation": 5.0, "airSupplyTicks": 300, "burning": False},
@@ -43,7 +87,10 @@ SITUATION: dict[str, Any] = {
                  "headingDegrees": 90.0, "onGround": True, "inWater": False, "inLava": False},
     "inventory": {"usedSlots": 4, "freeSlots": 32,
                   "stacks": [{"name": "dirt", "count": 10}, {"name": "cobblestone", "count": 5}]},
-    "tools": {"best": {"name": None, "tier": "none"}},
+    "tools": {
+        "tools": [_tool_row(kind) for kind in TOOL_CLASSES],
+        "armour": [_tool_row(kind) for kind in ARMOUR_CLASSES],
+    },
     "nearby": {
         "rangeBlocks": 16.0, "players": [], "hostiles": [], "mobs": [], "droppedItems": [],
     },
@@ -72,9 +119,28 @@ class FakeHost:
     health_calls: int = 0
     counter: int = 0
 
+    #: A survival reflex holding the body. While set, foreground submissions are
+    #: refused with ACTION_BUSY and *no* action id, which is what the real
+    #: `hostile_reflex` produces - there is no action to retrieve, only ownership
+    #: to wait out. Not drainable, but finite: `reflex_reads_left` counts the
+    #: view_status calls until it lets go.
+    reflex: str | None = None
+    reflex_reads_left: int = 0
+
     def new_id(self) -> str:
         self.counter += 1
         return f"act-{self.counter}"
+
+    def activity(self) -> dict[str, Any]:
+        """What view_status reports about ownership."""
+        if self.reflex:
+            return {"owner": "takeover",
+                    "activeAction": {"action": self.reflex, "startedAt": "2026-01-01T00:00:00.000Z"}}
+        active = self.admitted if self.admitted and self.admitted not in self.retrieved else None
+        if active:
+            return {"owner": "foreground",
+                    "activeAction": {"action": self.actions[active].tool, "startedAt": None}}
+        return {"owner": "idle", "activeAction": None}
 
 
 def build_app(host: FakeHost):
@@ -98,9 +164,19 @@ def build_app(host: FakeHost):
         }
 
     def is_error_for(data: dict[str, Any]) -> bool:
+        """Does this reply represent a failure, in either shape?
+
+        Direct replies carry no protocol ``state``, so the result object's own
+        ``status`` is the only thing left to judge them by.
+        """
         output = data.get("output")
         result = output.get("result") if isinstance(output, dict) else None
+        if not isinstance(result, dict):
+            direct = data.get("result")
+            result = direct if isinstance(direct, dict) else None
         status = result.get("status") if isinstance(result, dict) else None
+        if data.get("error"):
+            return True
         return data.get("state") in ("refused", "storage_failed") or status in ("failed", "cancelled")
 
     def envelope(data: dict[str, Any]):
@@ -122,12 +198,46 @@ def build_app(host: FakeHost):
 
     @server.tool(name="view_status", description="Read the live situation.")
     async def view_status(rationale: str = "", response_format: str = "markdown"):
+        # A *direct* reply, not the submission envelope. view_status is an
+        # information tool, and the server answers those immediately with
+        # {action, durationMs, result, survival, survivalPolicy} and no `state`
+        # at all. This stand-in used to wrap it in the envelope, which is how a
+        # client could agree with this file and still fail against the real host.
+        sit = copy.deepcopy(SITUATION)
+        if host.reflex_reads_left > 0:
+            host.reflex_reads_left -= 1
+            if host.reflex_reads_left == 0:
+                host.reflex = None  # the reflex ends and returns the body
+        sit["activity"] = host.activity()
         data = {
-            "state": "settled",
-            "wakeReason": "settled",
-            "actionId": "view",
-            "output": {"action": "view_status", "result": {"kind": "read", "status": "succeeded",
-                                                          "situation": SITUATION}},
+            "action": "view_status",
+            "durationMs": 1,
+            "result": {"kind": "read", "status": "succeeded", "situation": sit},
+            "survival": {"summary": "none", "dangers": []},
+            "survivalPolicy": {"revision": "fake:0", "effective": {}},
+        }
+        return envelope(data)
+
+    @server.tool(name="read_recent_events", description="Read recent events.")
+    async def read_recent_events(pad_bytes: int = 0, rationale: str = "",
+                                 response_format: str = "markdown"):
+        """A direct read whose reply can be made arbitrarily large.
+
+        ``pad_bytes`` is a test affordance, not a server feature. It exists
+        because httpx2 refuses any server-sent event above 1 MiB and the real
+        host's `tools/list` is 2.91 MiB - a ceiling nothing in this suite would
+        otherwise ever approach, which is precisely how that bug shipped.
+        """
+        data = {
+            "action": "read_recent_events",
+            "durationMs": 1,
+            "result": {
+                "kind": "read",
+                "status": "succeeded",
+                "events": [{"cursor": i, "text": "x" * 64} for i in range(8)],
+                "pad": "p" * max(0, pad_bytes),
+            },
+            "survival": {"summary": "none", "dangers": []},
         }
         return envelope(data)
 
@@ -149,6 +259,14 @@ def build_app(host: FakeHost):
                                  "action": existing.tool, "progress": {}, "request": None,
                                  "awaitingResult": None, "storageError": None})
             return _wait(host, existing, wait_timeout_ms)
+
+        if host.reflex:
+            # The survival reflex owns the body, so there is no action id to
+            # drain. This is the refusal the real host returns while its
+            # hostile_reflex runs, and the only thing that clears it is waiting.
+            return envelope({"state": "refused", "code": "ACTION_BUSY",
+                             "error": f"No new action started; body owner: {host.reflex}. "
+                                      "Wait for physical ownership to become available."})
 
         if host.admitted is not None and host.admitted not in host.retrieved:
             active = host.actions[host.admitted]

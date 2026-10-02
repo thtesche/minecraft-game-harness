@@ -21,6 +21,7 @@ from .ledger import Ledger
 from .mcp_client import McpClient
 from .objective import Objective, ObjectiveRunner
 from .state import StateReader
+from . import sse
 
 
 def _config(args: argparse.Namespace) -> Config:
@@ -41,7 +42,15 @@ async def cmd_health(args: argparse.Namespace) -> int:
     async with McpClient(config.mcp) as client:
         health = await client.health()
         tools = await client.list_tools()
-    print(json.dumps({"health": health, "toolCount": len(tools)}, indent=2))
+    print(json.dumps({
+        "health": health,
+        "toolCount": len(tools),
+        # Reported because it is the one thing that can stop every reply from
+        # arriving at all, and its failure mode names the network rather than
+        # itself. `installed: true` with `event_sourcesBuilt: 0` means the patch
+        # no longer matches the SDK's call site.
+        "sse": sse.describe(),
+    }, indent=2))
     return 0
 
 

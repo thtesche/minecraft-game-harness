@@ -16,3 +16,5 @@ runs/
 # Local configuration, which carries endpoint URLs and never belongs in git.
 harness.config.json
 config.local.json
+# macOS
+.DS_Store

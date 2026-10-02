@@ -27,7 +27,18 @@ def situation(**overrides):
                      "headingDegrees": 90.0, "onGround": True, "inWater": False, "inLava": False},
         "inventory": {"usedSlots": 4, "freeSlots": 32,
                       "stacks": [{"name": "dirt", "count": 10}, {"name": "cobblestone", "count": 5}]},
-        "tools": {"best": {"name": None, "tier": "none"}},
+        "tools": {
+            "tools": [
+                {"class": "pickaxe", "tier": "none", "item": None, "slot": None,
+                 "durabilityLeft": None, "maximumDurability": None},
+                {"class": "axe", "tier": "none", "item": None, "slot": None,
+                 "durabilityLeft": None, "maximumDurability": None},
+            ],
+            "armour": [
+                {"class": "helmet", "tier": "none", "item": None, "slot": None,
+                 "durabilityLeft": None, "maximumDurability": None},
+            ],
+        },
         "nearby": {
             "rangeBlocks": 16.0,
             "players": [],
@@ -79,7 +90,53 @@ async def test_tier_none_reports_no_tool_rather_than_a_placeholder():
     vector = await StateReader(client).read()
 
     assert vector.best_tool is None
+    assert vector.best_armour is None
     assert vector.has_water_bucket is False
+
+
+def _row(kind: str, tier: str, item: str | None) -> dict:
+    return {"class": kind, "tier": tier, "item": item, "slot": 36,
+            "durabilityLeft": 100, "maximumDurability": 250}
+
+
+async def test_the_best_tool_is_the_highest_tier_actually_held():
+    """Rows come one per class; the answer is the best one that holds something."""
+    sit = situation(tools={
+        "tools": [_row("pickaxe", "stone", "stone_pickaxe"),
+                  _row("axe", "iron", "iron_axe"),
+                  _row("sword", "none", None)],
+        "armour": [_row("helmet", "iron", "iron_helmet"),
+                   _row("boots", "leather", "leather_boots")],
+    })
+    vector = await StateReader(FakeClient(script={"view_status": [reply_with(sit)]})).read()
+
+    assert vector.best_tool == "iron_axe"
+    # Armour ranks separately: leather really is below iron, and the server's
+    # enum order (which puts armour materials after netherite) is not a ranking.
+    assert vector.best_armour == "iron_helmet"
+    assert vector.trustworthy
+
+
+async def test_a_tier_outside_the_declared_order_is_reported_not_ranked():
+    """An unknown tier must not be guessed into a position and reported as best."""
+    sit = situation(tools={
+        "tools": [_row("pickaxe", "turtle", "turtle_pickaxe")],
+        "armour": [_row("helmet", "none", None)],
+    })
+    vector = await StateReader(FakeClient(script={"view_status": [reply_with(sit)]})).read()
+
+    assert vector.best_tool is None
+    assert not vector.trustworthy
+    assert "not in the harness tier order" in vector.unverified[0]
+
+
+async def test_a_null_tools_section_does_not_crash_the_reading():
+    """The live host publishes `tools: null` when the table is unavailable."""
+    sit = situation(tools=None)
+    vector = await StateReader(FakeClient(script={"view_status": [reply_with(sit)]})).read()
+
+    assert vector.best_tool is None
+    assert vector.health == 18.0, "the rest of the vector is still read"
 
 
 async def test_missing_section_is_reported_not_defaulted():

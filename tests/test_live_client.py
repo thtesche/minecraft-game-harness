@@ -29,14 +29,80 @@ async def config_for(mcp_url: str, health_url: str) -> McpConfig:
     return McpConfig(url=mcp_url, health_url=health_url, initial_wait_ms=10, poll_ms=10, max_polls=5)
 
 
-async def test_client_reaches_the_server_and_parses_the_envelope(live):
-    """Structured content is parsed out of the real transport."""
-    host, mcp_url, health_url = await live.__aenter__()
+async def test_client_reaches_the_server_and_parses_a_direct_reply(live):
+    """An information tool answers directly, with no protocol state at all.
+
+    `view_status` is one of the ten direct tools on the live host. Reading it
+    through the submission envelope finds nothing and reports an empty world as
+    fact, so the direct shape is the one that has to work.
+    """
+    _, mcp_url, health_url = await live.__aenter__()
     try:
         async with McpClient(await config_for(mcp_url, health_url)) as client:
             reply = await client.call("view_status", {}, rationale="read state")
-        assert reply.state == "settled"
+        assert not reply.is_protocol
+        assert reply.state is None, "a direct reply carries no submission state"
         assert reply.result_status == "succeeded"
+        assert reply.result is not None
+        assert "situation" in reply.result
+    finally:
+        await live.__aexit__(None, None, None)
+
+
+async def test_the_two_reply_shapes_are_both_readable(live):
+    """One session answers in both shapes, and neither is assumed."""
+    _, mcp_url, health_url = await live.__aenter__()
+    try:
+        async with McpClient(await config_for(mcp_url, health_url)) as client:
+            direct = await client.call("view_status", {}, rationale="direct read")
+            enveloped = await client.call("collect_block",
+                                          {"submission_id": "shapes", "block_name": "dirt",
+                                           "wait_timeout_ms": 10},
+                                          rationale="foreground work")
+        assert direct.is_protocol is False and direct.state is None
+        assert enveloped.is_protocol is True
+        assert enveloped.require_state() == "settled"
+        # Same accessor, different spelling underneath.
+        assert direct.result["situation"] is not None
+        assert enveloped.result["status"] == "succeeded"
+    finally:
+        await live.__aexit__(None, None, None)
+
+
+async def test_a_direct_payload_on_submit_is_a_protocol_error(live):
+    """Submitting an objective must never quietly accept a non-envelope reply."""
+    from harness.errors import ProtocolError
+
+    _, mcp_url, health_url = await live.__aenter__()
+    try:
+        async with McpClient(await config_for(mcp_url, health_url)) as client:
+            runner = ObjectiveRunner(client, await config_for(mcp_url, health_url),
+                                     BudgetConfig(objective_ms=5_000))
+            with pytest.raises(ProtocolError):
+                await runner._submit(Objective(tool="view_status",
+                                               arguments={},
+                                               submission_id="wrong-shape"))
+    finally:
+        await live.__aexit__(None, None, None)
+
+
+async def test_a_reply_above_the_sdk_default_ceiling_still_arrives(live):
+    """The live host's `tools/list` is 2.91 MiB in one event; httpx2 caps at 1 MiB.
+
+    Without the bounded event parser this fails as a lost stream and the SDK
+    reports it as the connection dropping, which points at the network.
+    """
+    from harness import sse
+
+    _, mcp_url, health_url = await live.__aenter__()
+    try:
+        async with McpClient(await config_for(mcp_url, health_url)) as client:
+            assert sse.require_live_patch(), "the patch must be in effect on a real connection"
+            oversized = await client.call("read_recent_events",
+                                          {"pad_bytes": sse.SDK_DEFAULT_MAX_EVENT_BYTES + 4096},
+                                          rationale="a reply larger than httpx2 allows")
+        assert oversized.result_status == "succeeded"
+        assert len(oversized.result["pad"]) > sse.SDK_DEFAULT_MAX_EVENT_BYTES
     finally:
         await live.__aexit__(None, None, None)
 
@@ -250,13 +316,92 @@ async def test_invalid_arguments_settle_as_a_failed_objective(live):
         await live.__aexit__(None, None, None)
 
 
+async def test_a_survival_reflex_is_waited_out_not_given_up_on(live):
+    """ACTION_BUSY with no action id is a reflex holding the body.
+
+    There is nothing to drain - the reflex is not one of our actions - but it is
+    finite, so waiting is correct. The live world produces this whenever a mob
+    is nearby, which is most of the night, and treating it as terminal aborts
+    every objective for as long as the mob lives.
+    """
+    host, mcp_url, health_url = await live.__aenter__()
+    host.reflex = "hostile_reflex"
+    host.reflex_reads_left = 2
+    try:
+        async with McpClient(await config_for(mcp_url, health_url)) as client:
+            runner = ObjectiveRunner(
+                client,
+                await config_for(mcp_url, health_url),
+                BudgetConfig(objective_ms=5_000, gate_wait_ms=5_000),
+            )
+            result = await runner.run(Objective(tool="collect_block",
+                                               arguments={"block_name": "dirt"}))
+        assert result.ok, "the objective should run once the body comes free"
+        assert result.action_id
+    finally:
+        await live.__aexit__(None, None, None)
+
+
+async def test_a_body_that_never_frees_fails_honestly(live):
+    """A reflex that never lets go must terminate, not wait forever."""
+    host, mcp_url, health_url = await live.__aenter__()
+    host.reflex = "hostile_reflex"
+    host.reflex_reads_left = 10_000
+    try:
+        async with McpClient(await config_for(mcp_url, health_url)) as client:
+            config = await config_for(mcp_url, health_url)
+            runner = ObjectiveRunner(
+                client, config, BudgetConfig(objective_ms=5_000, gate_wait_ms=0)
+            )
+            with pytest.raises(ObjectiveFailed) as error:
+                await runner.run(Objective(tool="collect_block",
+                                           arguments={"block_name": "dirt"}))
+        assert error.value.state == "refused"
+    finally:
+        await live.__aexit__(None, None, None)
+
+
+async def test_an_unreadable_status_is_not_read_as_a_free_body():
+    """Guessing the body is free would submit into a reflex and call it an answer."""
+    from harness.mcp_client import ToolReply
+    from harness.objective import _is_free_body
+
+    assert _is_free_body(ToolReply(is_error=False, data={}, notifications={})) is False
+    # A direct read that parsed, but has no situation in it.
+    assert _is_free_body(ToolReply(is_error=False,
+                                   data={"action": "view_status", "result": {"status": "succeeded"}},
+                                   notifications={})) is False
+    # A situation with no activity section.
+    assert _is_free_body(ToolReply(is_error=False,
+                                   data={"action": "view_status",
+                                         "result": {"situation": {"vitals": {}}}},
+                                   notifications={})) is False
+    # A takeover is not free, even with no action named.
+    assert _is_free_body(ToolReply(is_error=False,
+                                   data={"action": "view_status",
+                                         "result": {"situation": {"activity": {"owner": "takeover",
+                                                                            "activeAction": None}}}},
+                                   notifications={})) is False
+    # Idle with no action is free.
+    assert _is_free_body(ToolReply(is_error=False,
+                                   data={"action": "view_status",
+                                         "result": {"situation": {"activity": {"owner": "idle",
+                                                                            "activeAction": None}}}},
+                                   notifications={})) is True
+
+
 async def test_state_reader_derives_from_the_real_view_status(live):
-    """The state vector, from a real view_status response."""
+    """The state vector, from a real direct view_status response.
+
+    This is the Phase 0 `harness state` path. It fails unless the direct reply
+    shape is read, which is why it is an integration test and not a unit test
+    over a hand-built reply.
+    """
     _, mcp_url, health_url = await live.__aenter__()
     try:
         async with McpClient(await config_for(mcp_url, health_url)) as client:
             vector = await StateReader(client).read()
-        assert vector.trustworthy
+        assert vector.trustworthy, vector.unverified
         assert vector.health == 20.0
         assert vector.time_phase == "day"
         assert vector.carried == ["dirtx10", "cobblestonex5"]

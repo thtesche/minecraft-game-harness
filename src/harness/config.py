@@ -37,6 +37,17 @@ class McpConfig:
     #: Ceiling on follow-up waits per objective. No unbounded polling.
     max_polls: int = 900
 
+    #: Ceiling on a single server-sent event.
+    #:
+    #: httpx2 caps an SSE event at 1 MiB and the SDK offers no way to raise it,
+    #: so a reply above that limit is dropped and surfaces as a lost stream. The
+    #: live host advertises 37 tools in one event of 2.91 MiB, because
+    #: mine-ai-mcp inlines every ``$ref`` into ``properties`` - ``wait_for_action``
+    #: alone is 913 KB. Measured 2026-10-02; this is 2.7x that, bounded because
+    #: an unbounded buffer is how a malformed server becomes an out-of-memory
+    #: kill instead of a diagnosable error.
+    max_sse_event_bytes: int = 8 * 1024 * 1024
+
     def health(self) -> str:
         return self.health_url
 
@@ -71,6 +82,14 @@ class BudgetConfig:
 
     #: Consecutive failures tolerated before the objective aborts.
     max_consecutive_failures: int = 3
+
+    #: How long to wait for a survival reflex to return the body before giving up
+    #: on the gate. An ``ACTION_BUSY`` refusal carrying no action id means a
+    #: reflex owns the body, and the reflex is finite - but a fight can run for
+    #: minutes, and the server's own combat budget allows 90 s of recovery. Bounded
+    #: because an ownership that never clears would otherwise hold every
+    #: objective for the whole objective budget and report a stall as progress.
+    gate_wait_ms: int = 180_000
 
 
 @dataclass(frozen=True)

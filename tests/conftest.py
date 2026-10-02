@@ -62,6 +62,43 @@ def refused(code: str, **extra: Any) -> ToolReply:
     )
 
 
+def body_owned(action: str = "hostile_reflex") -> ToolReply:
+    """A direct ``view_status`` reporting the body is held by a survival reflex."""
+    return ToolReply(
+        is_error=False,
+        data={
+            "action": "view_status",
+            "durationMs": 1,
+            "result": {
+                "kind": "read",
+                "status": "succeeded",
+                "situation": {
+                    "activity": {"owner": "takeover",
+                                 "activeAction": {"action": action, "startedAt": "now"}},
+                },
+            },
+        },
+        notifications={},
+    )
+
+
+def body_free() -> ToolReply:
+    """A direct ``view_status`` reporting ``owner: "idle"`` and no active action."""
+    return ToolReply(
+        is_error=False,
+        data={
+            "action": "view_status",
+            "durationMs": 1,
+            "result": {
+                "kind": "read",
+                "status": "succeeded",
+                "situation": {"activity": {"owner": "idle", "activeAction": None}},
+            },
+        },
+        notifications={},
+    )
+
+
 @dataclass
 class FakeClient:
     """Scripted MCP client.
@@ -108,7 +145,10 @@ def mcp_config() -> McpConfig:
 
 @pytest.fixture
 def budget() -> BudgetConfig:
-    return BudgetConfig(objective_ms=5_000, max_attempts_per_goal=3, max_consecutive_failures=2)
+    # gate_wait_ms=0 by default: a test that means to wait for the body says so
+    # explicitly, so an accidental wait cannot hide behind a passing bound.
+    return BudgetConfig(objective_ms=5_000, max_attempts_per_goal=3,
+                        max_consecutive_failures=2, gate_wait_ms=0)
 
 
 @pytest.fixture

@@ -8,8 +8,17 @@ a prompt.
 from __future__ import annotations
 
 import pytest
-from conftest import FakeClient, accepted, pending, refused, settled
+from conftest import (
+    FakeClient,
+    accepted,
+    body_free,
+    body_owned,
+    pending,
+    refused,
+    settled,
+)
 
+from harness.config import BudgetConfig
 from harness.errors import BudgetExceeded, ObjectiveFailed
 from harness.ledger import Ledger
 from harness.mcp_client import ToolReply
@@ -249,14 +258,64 @@ async def test_action_busy_drains_the_active_action(mcp_config, budget):
     ]
 
 
-async def test_action_busy_without_an_action_id_does_not_spin(mcp_config, budget):
-    """Busy because the bot owns the body is not an action to wait out.
+async def test_action_busy_without_an_action_id_waits_for_the_body(mcp_config, budget):
+    """A reflex holding the body is finite, so it is waited out rather than drained.
 
-    There is nothing to drain, so resubmitting would burn the objective budget
-    proving nothing.
+    There is no action id to retrieve, so nothing can be drained - but the
+    ownership ends. Treating it as terminal aborted every objective for as long
+    as a mob lived, which against the live world is most of the night.
     """
-    client = FakeClient(script={"collect_block": [refused("ACTION_BUSY", error="body owned by movement")]})
-    runner = make_runner(client, mcp_config, budget)
+    client = FakeClient(
+        script={
+            "collect_block": [refused("ACTION_BUSY", error="body owner: hostile_reflex"), settled("mine")],
+            "view_status": [body_owned(), body_free()],
+        }
+    )
+    runner = make_runner(client, mcp_config, BudgetConfig(objective_ms=5_000, gate_wait_ms=5_000))
+
+    result = await runner.run(Objective(tool="collect_block"))
+
+    assert result.action_id == "mine"
+    assert [name for name, _ in client.calls] == [
+        "collect_block",
+        "view_status",
+        "view_status",
+        "collect_block",
+    ]
+
+
+async def test_a_body_that_never_frees_stops_instead_of_spinning(mcp_config, budget):
+    """Ownership that never clears is a stall, and must terminate as one."""
+    client = FakeClient(
+        script={
+            "collect_block": [refused("ACTION_BUSY", error="body owner: hostile_reflex")],
+            "view_status": [body_owned()],
+        }
+    )
+    runner = make_runner(client, mcp_config, BudgetConfig(gate_wait_ms=0))
+
+    with pytest.raises(ObjectiveFailed):
+        await runner.run(Objective(tool="collect_block"))
+
+    assert len(client.args_for("collect_block")) == 1
+
+
+async def test_a_free_body_is_not_guessed_from_an_unreadable_status(mcp_config, budget):
+    """An opaque status must not be read as permission to submit.
+
+    Assuming the body is free submits into a reflex that still owns it, and the
+    resulting refusal then gets reported as the objective's answer.
+    """
+    from harness.mcp_client import ToolReply
+
+    opaque = ToolReply(is_error=False, data={"action": "view_status", "result": {}}, notifications={})
+    client = FakeClient(
+        script={
+            "collect_block": [refused("ACTION_BUSY", error="body owner: hostile_reflex")],
+            "view_status": [opaque],
+        }
+    )
+    runner = make_runner(client, mcp_config, BudgetConfig(gate_wait_ms=0))
 
     with pytest.raises(ObjectiveFailed):
         await runner.run(Objective(tool="collect_block"))

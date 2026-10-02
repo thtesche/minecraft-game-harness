@@ -20,6 +20,7 @@ Rules encoded here, each from the server's contract:
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -35,6 +36,10 @@ FAILURE_STATES = frozenset({"partial", "failed", "cancelled", "runtime_failure"}
 
 #: Refusals whose cause is another action, which waiting on can clear.
 GATE_REFUSALS = frozenset({"ACTION_BUSY", "RESULT_NOT_RETRIEVED"})
+
+#: The one body owner state that admits new work, from the server's own union in
+#: ``action-runner.ts``: ``"idle" | "foreground" | "yielding" | "takeover"``.
+FREE_BODY_OWNER = "idle"
 
 #: Return values from ``_release_gate``. Only these two: a gate either opens or
 #: it does not, and a refusal that cannot be drained stops the objective.
@@ -170,10 +175,15 @@ class ObjectiveRunner:
             arguments,
             rationale=objective.rationale or f"Harness objective: {objective.tool}",
         )
+        # Submitting a foreground objective and getting a direct payload back
+        # means the tool or the server changed shape. Interpreting that as a
+        # protocol state would report the world as refusing or admitting work
+        # that was never submitted.
+        state = reply.require_state()
         # A lost submission reply is recovered by repeating the identical call:
         # the server returns the original identity rather than starting again.
-        if reply.state in ("accepted", "pending") and reply.action_id is None:
-            raise UnverifiedRead(objective.tool, f"{reply.state} without an actionId")
+        if state in ("accepted", "pending") and reply.action_id is None:
+            raise UnverifiedRead(objective.tool, f"{state} without an actionId")
         return reply
 
     async def _release_gate(self, objective: Objective, reply: ToolReply) -> object:
@@ -204,9 +214,14 @@ class ObjectiveRunner:
             if isinstance(active, str):
                 await self._poll(objective, active)
                 return GATE_OPEN
-            # Busy with no action id means the bot owns the body rather than an
-            # action settling. Nothing to drain, so nothing to wait out.
-            return GATE_STUCK
+            # ACTION_BUSY with no action id is the survival reflex holding the
+            # body: `hostile_reflex` fighting something the model never asked
+            # about. There is no action to drain, but the ownership is finite -
+            # the reflex ends and returns the body - so waiting is the correct
+            # response. Treating it as terminal instead means a zombie at night
+            # aborts every objective for as long as it lives, which is most of
+            # the night.
+            return GATE_OPEN if await self._await_free_body(objective) else GATE_STUCK
 
         if code == "RUNTIME_UNAVAILABLE":
             # The bot connection ended. The world effects of whatever was
@@ -248,12 +263,50 @@ class ObjectiveRunner:
             if reply.state != "pending":
                 return reply, polls
 
+    async def _await_free_body(self, objective: Objective) -> bool:
+        """Wait for the survival reflex to return the body.
+
+        Read from ``view_status`` rather than retried blindly, because the server
+        already reports who owns the body and re-submitting into a reflex is what
+        produced the refusal in the first place. This is a deterministic wait (D7):
+        the server does the observing, and no model is consulted about whether a
+        fight is over.
+
+        Bounded twice - by wall clock, because a fight is legitimately slow, and
+        by wait count, because a reflex that never releases must not spin here
+        forever. Returns whether the body came free.
+        """
+        deadline = self.clock() + self.budget.gate_wait_ms / 1000
+        polls = 0
+
+        while True:
+            if self.clock() > deadline:
+                return False
+            if polls >= self.config.max_polls:
+                return False
+            if await self._body_is_free():
+                return True
+            polls += 1
+            await asyncio.sleep(self.config.poll_ms / 1000)
+
+    async def _body_is_free(self) -> bool:
+        """Is the body unowned right now?"""
+        reply = await self.client.call(
+            "view_status", {}, rationale="Check whether the body is free to accept work"
+        )
+        return _is_free_body(reply)
+
     async def _wait_once(self, objective: Objective, action_id: str) -> ToolReply:
-        return await self.client.call(
+        reply = await self.client.call(
             "wait_for_action",
             {"action_id": action_id, "timeout_ms": self.config.poll_ms},
             rationale=objective.rationale or f"Retrieve result for {objective.tool}",
         )
+        # `wait_for_action` is a control tool rather than a foreground one, but
+        # it is the one control tool that speaks the submission envelope, so the
+        # envelope is required here for the same reason it is on submit.
+        reply.require_state()
+        return reply
 
     def _to_result(
         self,
@@ -277,7 +330,7 @@ class ObjectiveRunner:
             else:
                 state = status
                 if status in FAILURE_STATES:
-                    error = _error_text(reply.output)
+                    error = _error_text(reply)
             if status is None:
                 error = "settled output carried no result status"
         elif reply.state == "storage_failed":
@@ -331,12 +384,35 @@ class ObjectiveRunner:
             self.ledger.record(row)
 
 
-def _error_text(output: dict[str, Any] | None) -> str | None:
-    if not isinstance(output, dict):
+def _error_text(reply: ToolReply) -> str | None:
+    result = reply.result
+    if result is None:
         return None
-    result = output.get("result")
-    if isinstance(result, dict):
-        error = result.get("error")
-        if isinstance(error, str):
-            return error
-    return None
+    error = result.get("error")
+    return error if isinstance(error, str) else None
+
+
+def _is_free_body(reply: ToolReply) -> bool:
+    """Does this status read report an unowned body?
+
+    ``owner: "idle"`` with no active action, which is exactly what the server
+    reports as ``busy: false`` - bound from the owner union in
+    ``action-runner.ts`` rather than assumed.
+
+    A read that cannot be parsed is **not** freedom. Guessing that the body is
+    free submits into a reflex that still owns it and then reports the resulting
+    refusal as an answer, which is the one outcome this wait exists to prevent.
+    """
+    result = reply.result
+    if result is None:
+        return False
+    situation = result.get("situation")
+    if not isinstance(situation, dict):
+        return False
+    activity = situation.get("activity")
+    if not isinstance(activity, dict):
+        return False
+    return (
+        activity.get("owner") == FREE_BODY_OWNER
+        and activity.get("activeAction") is None
+    )

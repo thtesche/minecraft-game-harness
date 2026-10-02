@@ -27,6 +27,24 @@ from .mcp_client import McpClient
 DEFAULT_MAX_INVENTORY_ITEMS = 12
 DEFAULT_MAX_NEARBY = 4
 
+#: Material order for tools and for armour, best last.
+#:
+#: The server publishes one row per class and states its own ``tier``; what it
+#: does not publish is a *ranking* of those tiers, and its enum order is not one
+#: - it lists the armour materials after netherite. So the order is stated here
+#: as Minecraft's own material progression, which is a fact about the game rather
+#: than an inference about the server. A tier absent from these lists is not
+#: ranked at all: it is skipped and reported, never guessed into a position.
+#:
+#: Bound from ``mine-ai-mcp/src/world/tool-tiers.ts``, whose enum is
+#: ``wooden stone iron golden diamond netherite leather chainmail turtle other none``.
+TOOL_TIER_ORDER = ("wooden", "stone", "iron", "golden", "diamond", "netherite")
+ARMOUR_TIER_ORDER = ("leather", "chainmail", "turtle", "golden", "iron", "diamond", "netherite")
+
+#: Rows the server emits for every class whether or not anything is held. These
+#: say "nothing here", which is a fact worth stating rather than omitting.
+EMPTY_TIER = "none"
+
 
 @dataclass
 class StateVector:
@@ -120,18 +138,19 @@ class StateReader:
         reply = await self.client.call(
             "view_status", {}, rationale="Read live situation for the decision vector"
         )
-        if reply.is_error and reply.state not in ("settled",):
+        if reply.is_error:
             return StateVector(
-                unverified=[f"view_status returned {reply.state}: {reply.data.get('error')}"]
+                unverified=[f"view_status failed: {reply.data.get('error')}"]
             )
 
-        output = reply.output
-        if output is None:
-            return StateVector(unverified=["view_status settled without an output"])
-
-        situation = output.get("result", {}).get("situation") if isinstance(output.get("result"), dict) else None
-        if not isinstance(situation, dict):
-            return StateVector(unverified=["view_status output had no situation object"])
+        situation = _situation(reply)
+        if situation is None:
+            return StateVector(
+                unverified=[
+                    "view_status carried no situation in either reply shape: "
+                    f"{sorted(reply.data)}"
+                ]
+            )
 
         return self._derive(situation)
 
@@ -160,8 +179,11 @@ class StateReader:
 
         tools = _section(situation, "tools")
         if isinstance(tools, dict):
-            vector.best_tool = _best_tier(tools.get("best"))
-            vector.best_armour = _best_tier(tools, prefix="armour")
+            vector.best_tool, unranked = _best_item(tools.get("tools"), TOOL_TIER_ORDER)
+            vector.best_armour, unranked_armour = _best_item(
+                tools.get("armour"), ARMOUR_TIER_ORDER
+            )
+            vector.unverified.extend(unranked + unranked_armour)
 
         inventory = _section(situation, "inventory")
         if isinstance(inventory, dict):
@@ -218,7 +240,9 @@ class StateReader:
         """
         required = (
             "vitals",
+            "clock",
             "position",
+            "tools",
             "inventory",
             "nearby",
             "mobility",
@@ -238,8 +262,36 @@ class StateReader:
         )
         if reply.is_error:
             return {"error": reply.data.get("error"), "unverified": True}
-        output = reply.output or {}
-        return {"unverified": False, "output": output}
+        result = reply.result
+        if result is None:
+            return {"unverified": True, "reply": reply.data}
+        return {"unverified": False, "output": result}
+
+
+def _situation(reply: ToolReply) -> dict[str, Any] | None:
+    """The situation object, from whichever reply shape the server used.
+
+    ``view_status`` answers directly - ``data.result.situation`` - while an
+    enveloped tool of the same name would nest it at
+    ``data.output.result.situation``. Both spellings are accepted, and neither is
+    assumed, because the split between direct and foreground tools belongs to
+    the server and changes without notice: ``foreground`` is not published on the
+    wire, and only the presence of ``submission_id`` in an advertised schema
+    hints at it.
+
+    Returning ``None`` for both is the important case. It becomes ``unverified``
+    rather than an empty world.
+    """
+    for path in (("result", "situation"), ("output", "result", "situation")):
+        node: Any = reply.data
+        for key in path:
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(key)
+        if isinstance(node, dict):
+            return node
+    return None
 
 
 def _section(situation: dict[str, Any], key: str) -> Any:
@@ -268,23 +320,37 @@ def _round(value: Any, digits: int = 1) -> float | None:
     return _number(value, digits)
 
 
-def _best_tier(tools: dict[str, Any], prefix: str = "") -> str | None:
-    """Best tier carried, if any.
+def _best_item(entries: Any, order: tuple[str, ...]) -> tuple[str | None, list[str]]:
+    """Best item held, from the server's one-row-per-class tool table.
 
-    ``bot_tools`` rows use tier ``none`` when nothing is held, which is a fact
-    worth stating rather than omitting.
+    ``situation.tools`` is ``{"tools": [...], "armour": [...]}`` with one entry
+    per class - twelve tool classes and four armour pieces, all present whether
+    or not anything is held, and an entry that holds nothing carries
+    ``tier: "none"`` and ``item: null``. So an absent answer is a fact about the
+    world (nothing held) and not a missing read.
+
+    Returns the item name and the tiers that could not be ranked. A row whose
+    tier this function does not know is reported rather than assumed, because
+    ranking it wrongly would report the wrong best tool with total confidence.
     """
-    best = tools.get("best")
-    if not isinstance(best, dict):
-        return None
-    if prefix:
-        best = best.get(prefix, {})
-        if not isinstance(best, dict):
-            return None
-    name = best.get("name") or best.get("item")
-    tier = best.get("tier")
-    if isinstance(tier, str) and tier == "none":
-        return None
-    if isinstance(name, str):
-        return name
-    return None
+    if not isinstance(entries, list):
+        return None, []
+
+    best: tuple[int, str] | None = None
+    unranked: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        item = entry.get("item")
+        tier = entry.get("tier")
+        if not isinstance(item, str):
+            continue  # nothing held in this class
+        if tier == EMPTY_TIER:
+            continue
+        if tier not in order:
+            unranked.append(f"{item} (tier {tier!r} not in the harness tier order)")
+            continue
+        rank = order.index(tier)
+        if best is None or rank > best[0]:
+            best = (rank, item)
+    return (best[1] if best else None), unranked
