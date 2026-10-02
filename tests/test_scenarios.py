@@ -36,6 +36,7 @@ from harness.scenario import (
     Verdict,
     evaluate,
     format_report,
+    start_mismatch,
     verdicts_for,
     world_facts,
 )
@@ -192,6 +193,10 @@ def scenario_file(tmp_path, payload):
     return path
 
 
+def loaded(tmp_path, payload):
+    return Scenario.load(scenario_file(tmp_path, payload))
+
+
 def test_a_minimal_scenario_loads(tmp_path):
     scenario = Scenario.load(scenario_file(tmp_path, MINIMAL))
     assert scenario.name == "s"
@@ -258,6 +263,66 @@ def test_a_missing_scenario_file_is_named_rather_than_a_traceback():
         Scenario.load("does/not/exist.json")
     assert "does/not/exist.json" in str(caught.value)
     assert "could not be read" in str(caught.value)
+
+
+def test_a_matching_starting_world_is_not_a_mismatch(tmp_path):
+    scenario = loaded(tmp_path, {**MINIMAL, "startsFrom": {"inventory": {"dirt": 4}}})
+    assert start_mismatch(scenario, world_facts({**SITUATION, "inventory": {
+        "usedSlots": 1, "freeSlots": 35, "stacks": [stack("dirt", 4)],
+    }})) is None
+
+
+def test_a_starting_world_that_differs_is_refused_by_name(tmp_path):
+    """Both sides named, because the fix is to correct the scenario or the world.
+
+    The premise is the measurement. A bot that already holds the logs makes this
+    a different and easier question, and a report saying `within_calls: 3`
+    without saying the bot started with logs is a number with a hidden term in it.
+    """
+    scenario = loaded(tmp_path, {**MINIMAL, "startsFrom": {"inventory": {"dirt": 4, "oak_log": 1}}})
+    mismatch = start_mismatch(scenario, world_facts(SITUATION))
+    assert mismatch is not None
+    assert "1x oak_log" in mismatch and "8x stick" in mismatch, "both sides must be readable"
+    assert "16x acacia_log" in mismatch, "the world's own stacks must be listed"
+    assert scenario.name in mismatch
+
+
+def test_extra_and_missing_stacks_are_both_a_mismatch(tmp_path):
+    """Exact, not "at least": more logs than declared is the easier question too."""
+    scenario = loaded(tmp_path, {**MINIMAL, "startsFrom": {"inventory": {"dirt": 4}}})
+    extra = world_facts({**SITUATION, "inventory": {
+        "usedSlots": 2, "freeSlots": 34, "stacks": [stack("dirt", 4), stack("oak_log", 1)],
+    }})
+    assert start_mismatch(scenario, extra) is not None
+    fewer = world_facts({**SITUATION, "inventory": {
+        "usedSlots": 1, "freeSlots": 35, "stacks": [stack("dirt", 2)],
+    }})
+    assert start_mismatch(scenario, fewer) is not None
+
+
+def test_an_unreadable_world_is_never_reported_as_matching(tmp_path):
+    """The one answer that would be a lie: "the premise holds" about a world never read."""
+    scenario = loaded(tmp_path, {**MINIMAL, "startsFrom": {"inventory": {"dirt": 4}}})
+    assert "could not be read" in start_mismatch(scenario, None)
+    incomplete = world_facts({"clock": SITUATION["clock"]})
+    assert "incomplete" in start_mismatch(scenario, incomplete)
+
+
+def test_a_scenario_with_no_starting_condition_is_never_a_mismatch():
+    assert start_mismatch(Scenario("x", GoalSet(()), ()), world_facts(SITUATION)) is None
+
+
+def test_a_typo_in_the_starting_condition_is_refused_not_ignored(tmp_path):
+    """A misspelt key would check nothing, so the premise vanishes rather than fails."""
+    with pytest.raises(ScenarioError) as caught:
+        Scenario.load(scenario_file(tmp_path, {**MINIMAL, "startsFrom": {"inventry": {"dirt": 4}}}))
+    assert "inventry" in str(caught.value)
+
+
+def test_a_starting_count_of_zero_is_refused():
+    """Absence is expressed by omitting the item; a zero would read as a free pass."""
+    with pytest.raises(ScenarioError):
+        Scenario("x", GoalSet(()), (), starts_from={"inventory": {"dirt": 0}})
 
 
 def test_the_shipped_scenarios_parse():

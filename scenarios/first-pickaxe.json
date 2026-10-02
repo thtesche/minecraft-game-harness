@@ -1,6 +1,6 @@
 {
   "name": "first-pickaxe",
-  "prompt": "Start with nothing and end holding a wooden pickaxe.",
+  "prompt": "Reach a wooden pickaxe and end holding it.",
   "goals": [
     "wooden_pickaxe"
   ],
@@ -11,6 +11,10 @@
     { "kind": "within_calls", "calls": 8 }
   ],
   "maxSteps": 16,
+  "startsFrom": {
+    "inventory": { "dirt": 4, "oak_log": 1, "acacia_log": 3 },
+    "note": "Not literally nothing. The bot rejoined this world holding 4 dirt and 4 logs, and the user chose to keep the world and record the real starting state rather than regenerate it. So the premise is 'no tools and no crafting table, but some logs already in hand' - not 'empty inventory'. 4 logs is roughly a quarter of what a wooden pickaxe needs, so this is a slightly easier question than the reference's, and the reference's own number is below this budget either way (2 objective submissions). The prompt deliberately does not claim an empty inventory: the model is shown the real state vector, so a prompt asserting otherwise would contradict what it reads."
+  },
   "reference": {
     "source": "aibengineering/beat-the-game-minecraft (claude-opus-5[1m], effort high)",
     "toolCalls": 4,

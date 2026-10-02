@@ -34,6 +34,7 @@ from .scenario import (
     WorldFacts,
     format_report,
     situation_of,
+    start_mismatch,
     verdicts_for,
     world_facts,
 )
@@ -300,6 +301,15 @@ async def cmd_run_scenario(args: argparse.Namespace) -> int:
             print(f"checks: {', '.join(check.kind for check in scenario.checks)}", file=sys.stderr)
             if scenario.prompt:
                 print(f"prompt: {scenario.prompt}", file=sys.stderr)
+
+            # The premise is checked against the live world *before* the loop
+            # starts, not reported after: a run whose starting inventory did not
+            # match produces a number that looks fine and is not comparable to
+            # anything. Refusing here spends one read and no objectives.
+            start = start_mismatch(scenario, await _world_facts(client))
+            if start is not None:
+                print(f"scenario refused before the run: {start}", file=sys.stderr)
+                return 64
 
             loop = RunLoop(
                 StateReader(client),

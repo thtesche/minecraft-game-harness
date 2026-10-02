@@ -237,6 +237,24 @@ class Scenario:
     #: state deterministically without spending a submission. The numbers are
     #: reported side by side and a reader draws the conclusion.
     reference: dict[str, Any] = field(default_factory=dict)
+    #: The world state this scenario's number is only valid *from*, checked
+    #: against a live read before the loop starts. ``inventory`` is the exact set
+    #: of stacks the bot is expected to hold, name to count - exact, because the
+    #: premise is the measurement: a bot that already holds the logs makes
+    #: "reach a pickaxe from nothing" a different and easier question, and a
+    #: report that says ``within_calls: 3`` without saying the bot started with
+    #: logs is a number with a hidden term in it. Recorded here because the world
+    #: is not the scenario's to choose; a mismatch is a refusal naming both sides
+    #: so the scenario is corrected against reality rather than reality quietly
+    #: edited to fit.
+    starts_from: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Validated here rather than only in ``load``, because a check that only
+        # one construction path applies is not a check: a ``Scenario`` built in a
+        # test or a future caller would carry a premise nothing ever enforced, and
+        # the run against it would quietly measure the wrong thing.
+        _check_starts_from(self.starts_from, self.name or "<unnamed scenario>")
 
     @classmethod
     def load(cls, path: Path | str) -> "Scenario":
@@ -255,7 +273,7 @@ class Scenario:
         if not isinstance(raw, dict):
             raise ScenarioError(f"{scenario_path}: expected an object, got {type(raw).__name__}")
 
-        known = {"name", "prompt", "goals", "checks", "maxSteps", "reference"}
+        known = {"name", "prompt", "goals", "checks", "maxSteps", "reference", "startsFrom"}
         unknown = set(raw) - known
         if unknown:
             raise ScenarioError(
@@ -279,14 +297,93 @@ class Scenario:
             raise ScenarioError(
                 f"{scenario_path}: reference must be an object, got {type(reference).__name__}"
             )
-        return cls(
+        starts_from = raw.get("startsFrom", {})
+        if not isinstance(starts_from, dict):
+            raise ScenarioError(
+                f"{scenario_path}: startsFrom must be an object, got {type(starts_from).__name__}"
+            )
+        _check_starts_from(starts_from, str(scenario_path))
+        return cls(  # __post_init__ checks starts_from again, by design: see there.
             name=name.strip(),
             goals=goals,
             checks=checks,
             prompt=prompt,
             max_steps=max_steps,
             reference=reference,
+            starts_from=starts_from,
         )
+
+
+#: Keys ``startsFrom`` accepts. ``inventory`` is the one that is enforced; ``note``
+#: is prose for the reader and is carried into the report unparsed.
+STARTS_FROM_KEYS = frozenset({"inventory", "note"})
+
+
+def _check_starts_from(starts_from: dict[str, Any], source: str) -> None:
+    """Refuse a starting condition the harness cannot enforce.
+
+    A permissive loader here would mean a typo'd ``inventry`` silently checks
+    nothing, which is the premise disappearing rather than failing - so unknown
+    keys are refused, and so is an inventory that is not a flat name-to-count map.
+    """
+    unknown = set(starts_from) - STARTS_FROM_KEYS
+    if unknown:
+        raise ScenarioError(
+            f"{source}: startsFrom unknown keys {sorted(unknown)}; expected "
+            f"{sorted(STARTS_FROM_KEYS)}. A typo'd key here would check nothing at all, "
+            "which is the premise vanishing rather than failing."
+        )
+    if "inventory" not in starts_from:
+        return
+    inventory = starts_from["inventory"]
+    if not isinstance(inventory, dict):
+        raise ScenarioError(
+            f"{source}: startsFrom.inventory must be an object mapping item name to count"
+        )
+    for item, count in inventory.items():
+        if not isinstance(item, str) or not item:
+            raise ScenarioError(f"{source}: startsFrom.inventory has an empty item name")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ScenarioError(
+                f"{source}: startsFrom.inventory[{item!r}] must be a count of at least 1, "
+                f"got {count!r}; a stack the bot must NOT hold is expressed by omitting it, "
+                "not by a zero or a negative"
+            )
+
+
+def start_mismatch(scenario: Scenario, facts: WorldFacts | None) -> str | None:
+    """Why the world is not the one this scenario's number is valid from.
+
+    ``None`` when it matches, when the scenario declares no precondition, or when
+    the world could not be read - the last of which is *not* a match. An
+    unreadable world is reported as such rather than passed, so the caller can
+    refuse; saying "the precondition holds" about a world it never read is the
+    one answer that would be a lie.
+    """
+    declared = scenario.starts_from.get("inventory")
+    if not isinstance(declared, dict):
+        return None
+    if facts is None:
+        return "the world could not be read, so the scenario's starting condition is unchecked"
+    if facts.unverified:
+        return (
+            "the starting world read was incomplete ("
+            + "; ".join(facts.unverified)
+            + "), so the scenario's starting condition is unchecked"
+        )
+    held = dict(sorted(facts.inventory.items()))
+    expected = dict(sorted(declared.items()))
+    if held == expected:
+        return None
+    wanted = ", ".join(f"{count}x {item}" for item, count in expected.items()) or "nothing"
+    actual = ", ".join(f"{count}x {item}" for item, count in held.items()) or "nothing"
+    return (
+        f"the world does not match this scenario's starting condition. "
+        f"scenario {scenario.name!r} declares: {wanted}. world holds: {actual}. "
+        "A scenario that cannot measure what it claims must not produce a number, "
+        "so either empty the bot's inventory or correct startsFrom.inventory to the "
+        "world as it actually is."
+    )
 
 
 def _checks(raw: Any, source: str) -> tuple[Check, ...]:
