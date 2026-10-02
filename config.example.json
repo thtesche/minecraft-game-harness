@@ -6,7 +6,8 @@
     "initial_wait_ms": 5000,
     "poll_ms": 2000,
     "max_polls": 900,
-    "max_sse_event_bytes": 8388608
+    "max_sse_event_bytes": 8388608,
+    "submission_prefix": ""
   },
   "ledger": {
     "path": "runs/ledger.jsonl",
@@ -15,7 +16,8 @@
   "budget": {
     "objective_ms": 900000,
     "max_attempts_per_goal": 12,
-    "max_consecutive_failures": 3
+    "max_consecutive_failures": 3,
+    "gate_wait_ms": 180000
   },
   "laya": {
     "model": "laya",

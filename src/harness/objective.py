@@ -67,6 +67,20 @@ class ObjectiveResult:
         return self.state == "settled" and self.status == "succeeded" and self.evidence_ok
 
 
+@dataclass(frozen=True)
+class SeenState:
+    """What the decider saw when it chose this objective.
+
+    Carried into the ledger row rather than recorded separately, because the
+    Phase 2 baseline and the Phase 3 eval both need the state and the outcome in
+    one row: a state joined to an outcome from a different step is a correlation
+    the evidence does not support.
+    """
+
+    vector: dict[str, Any]
+    state_hash: str
+
+
 @dataclass
 class Objective:
     """One thing to ask the bot to do."""
@@ -101,21 +115,39 @@ class ObjectiveRunner:
         #: shut, so a run that exhausts this is evidence the gate is jammed.
         self.max_gate_recoveries = max_gate_recoveries
 
-    async def run(self, objective: Objective) -> ObjectiveResult:
+    async def run(self, objective: Objective, seen: SeenState | None = None) -> ObjectiveResult:
         """Submit, wait, verify. Never raises on a failed objective.
 
         Returns the result and records a ledger row; the caller decides what to
         do next. A refusal the runner cannot resolve raises, because continuing
         would mean guessing at the protocol.
+
+        ``seen`` is what the decider saw when it chose this objective. Without
+        it the row still records what was submitted and what came of it, but not
+        why, which is the half of the ledger that cannot be reconstructed later.
         """
         started = self.clock()
         row = DecisionRow(
-            state_vector={"objective": objective.tool, "arguments": objective.arguments},
+            state_vector=(
+                seen.vector if seen else {"objective": objective.tool, "arguments": objective.arguments}
+            ),
+            state_hash=seen.state_hash if seen else "",
             question={"kind": "objective", "tool": objective.tool},
             objective_tool=objective.tool,
             objective_args=objective.arguments,
             run_id=self.ledger.run_id if self.ledger else "",
         )
+
+        if seen is not None:
+            row.question = {
+                "kind": "objective",
+                "tool": objective.tool,
+                "rationale": objective.rationale,
+                "source": objective.metadata.get("source", "unknown"),
+            }
+            row.options = list(objective.metadata.get("options", ()))
+            row.answer = objective.tool
+            row.answer_confidence = objective.metadata.get("confidence")
 
         reply = await self._submit(objective)
 

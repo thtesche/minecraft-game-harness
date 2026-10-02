@@ -16,6 +16,9 @@ to re-derive those spends a call on arithmetic.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -73,8 +76,79 @@ class StateVector:
     has_water_bucket: bool | None = None
     has_scaffold: bool | None = None
 
+    #: The most recent death the server has observed. A loop compares this across
+    #: a step to tell "the objective failed" from "the bot died mid-objective",
+    #: which are different events with different recoveries.
+    last_death_at: str | None = None
+    last_death_cause: str | None = None
+
     #: Why the state is not trustworthy, if it is not.
     unverified: list[str] = field(default_factory=list)
+
+    @property
+    def state_hash(self) -> str:
+        """A stable identity for "the state the model saw".
+
+        This is the key the Memo cache is built on and the one field in
+        ``DecisionRow`` that cannot be recovered after the fact, so it is written
+        at read time or not at all.
+
+        Quantised, and that is the whole design question here. Hashing the vector
+        verbatim would produce a hash that never repeats: two reads a second apart
+        differ in position, and ``observedAt`` differs every time. A cache keyed on
+        that records one hit in every thousand rows and appears to do nothing,
+        which is indistinguishable from a model that ignores the cache. So the bins
+        are chosen at the granularity a decision could actually turn on:
+
+        * health and food to the nearest whole point - the server reports half
+          hearts, and the next decision does not turn on half a heart
+        * position to the nearest 8 blocks, half a chunk
+        * distances to the nearest block
+
+        Discrete facts - what is carried, which tier is best, how many hostiles -
+        are hashed exactly. Two states with the same hash are not guaranteed to be
+        identical; they are guaranteed to be identical *in every respect the
+        decision could turn on*, which is the property a cache needs and a stronger
+        claim than this can honestly make.
+        """
+        return hashlib.sha256(
+            json.dumps(self._hashable(), sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:16]
+
+    def _hashable(self) -> dict[str, Any]:
+        """The vector as the cache keys on it: binned, and no reading timestamp."""
+        return {
+            "health": _bin(self.health),
+            "food": _bin(self.food),
+            "time": self.time_phase,
+            "position": {axis: _bin(value, 8) for axis, value in sorted(self.position.items())},
+            "stance": {"on_ground": self.on_ground, "in_water": self.in_water},
+            "gear": {"best_tool": self.best_tool, "best_armour": self.best_armour},
+            "inventory": {
+                "used": self.used_slots,
+                "free": self.free_slots,
+                "carried": self.carried,
+            },
+            "nearby": {
+                "hostiles": self.hostiles_within,
+                "hostile": self.nearest_hostile,
+                "distance": _bin(self.nearest_hostile_distance),
+                "drop": self.nearest_drop,
+            },
+            "mobility": {
+                "drop": self.max_unassisted_drop,
+                "bucket": self.has_water_bucket,
+                "scaffold": self.has_scaffold,
+            },
+            # A state that failed to verify is a different state, and the whole
+            # point of hashing it separately is that the loop must not treat an
+            # unread world as the world it read a moment ago.
+            "unverified": self.unverified,
+            # Hashed exactly, not binned: it only changes when the bot dies, and a
+            # bot that just died is in a materially different situation from one
+            # that has not died this session.
+            "last_death_at": self.last_death_at,
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -105,6 +179,13 @@ class StateVector:
                 "max_unassisted_drop": self.max_unassisted_drop,
                 "water_bucket": self.has_water_bucket,
                 "scaffold": self.has_scaffold,
+            },
+            # Surfaced rather than left internal because a bot that just died is a
+            # different situation, and a decider that cannot see that will keep
+            # proposing whatever it would have proposed anyway.
+            "survival": {
+                "last_death_at": self.last_death_at,
+                "last_death_cause": self.last_death_cause,
             },
             "unverified": self.unverified,
         }
@@ -213,6 +294,11 @@ class StateReader:
             if isinstance(scaffold, dict):
                 vector.has_scaffold = bool(scaffold.get("available"))
 
+        death = _section(situation, "lastDeath")
+        if isinstance(death, dict):
+            vector.last_death_at = death.get("observedAt")
+            vector.last_death_cause = death.get("cause")
+
         return vector
 
     def _carried(self, inventory: dict[str, Any]) -> list[str]:
@@ -292,6 +378,18 @@ def _situation(reply: ToolReply) -> dict[str, Any] | None:
         if isinstance(node, dict):
             return node
     return None
+
+
+def _bin(value: float | None, width: int = 1) -> int | None:
+    """Round to the nearest ``width``, half away from zero, or stay ``None``.
+
+    ``None`` is preserved rather than folded into a number: an unread field and a
+    field reading zero are different facts, and the cache that cannot tell them
+    apart will serve the wrong answer while looking correct.
+    """
+    if value is None:
+        return None
+    return math.floor(value / width + 0.5) * width if value >= 0 else -math.floor(-value / width + 0.5) * width
 
 
 def _section(situation: dict[str, Any], key: str) -> Any:

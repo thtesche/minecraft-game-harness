@@ -98,3 +98,14 @@ def test_laya_option_budget_is_not_raised_by_default():
 
     assert laya.head_max_len <= 192
     assert laya.max_concurrency == 1, "concurrent MPS forwards abort the process"
+
+
+def test_submission_prefix_is_opt_in_and_documented():
+    """Empty by default, so nothing changes for a caller that never set it.
+
+    Set per run rather than per process, because the point is attribution: an id
+    that appears twice in the server's records should be identifiable as ours. The
+    CLI falls back to the run id, so a run always carries one.
+    """
+    assert McpConfig().submission_prefix == ""
+    assert Config.from_dict({"mcp": {"submission_prefix": "run-7-"}}).mcp.submission_prefix == "run-7-"

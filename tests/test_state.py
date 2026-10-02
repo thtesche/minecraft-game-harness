@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from conftest import FakeClient
 
-from harness.state import StateReader
+from harness.state import StateReader, StateVector
 
 
 def situation(**overrides):
@@ -193,7 +193,7 @@ async def test_vector_is_serialisable_and_small():
 
     assert set(payload) == {
         "health", "food", "time", "position", "stance",
-        "gear", "inventory", "nearby", "mobility", "unverified",
+        "gear", "inventory", "nearby", "mobility", "survival", "unverified",
     }
     assert payload["position"]["x"] == -57.6
 
@@ -207,3 +207,99 @@ async def test_rounding_happens_once():
     vector = await StateReader(client).read()
 
     assert vector.position["y"] == 71.2
+
+
+# --- state_hash -------------------------------------------------------------
+#
+# The hash is the Memo cache key, and the one ledger field that cannot be
+# recovered after the fact. Its whole design question is quantisation: hashed
+# verbatim it never repeats, because two reads a second apart differ in position,
+# and a cache that never hits is indistinguishable from a model that ignores it.
+
+
+async def read_hash(**overrides) -> str:
+    client = FakeClient(script={"view_status": [reply_with(situation(**overrides))]})
+    return (await StateReader(client).read()).state_hash
+
+
+def standing(**overrides):
+    return situation(position={"x": -57.551, "y": 71.0, "z": -0.632,
+                               "onGround": True, "inWater": False}, **overrides)
+
+
+async def test_two_reads_a_second_apart_share_a_hash():
+    """The property the cache depends on: drift inside a bin is not a new state."""
+    drifted = situation(position={"x": -57.480, "y": 71.0, "z": -0.601,
+                                  "onGround": True, "inWater": False})
+    assert await read_hash(**standing()) == await read_hash(**drifted)
+
+
+async def test_moving_a_whole_chunk_moves_the_hash():
+    """The bin is half a chunk wide, so a chunk of travel is a different place."""
+    far = situation(position={"x": -40.0, "y": 71.0, "z": -0.632,
+                              "onGround": True, "inWater": False})
+    assert await read_hash(**standing()) != await read_hash(**far)
+
+
+async def test_a_decisive_change_in_vitals_moves_the_hash():
+    """Half a heart of drift is noise; three hearts is a different situation."""
+    hurt = await read_hash(vitals={"health": 17.0, "food": 18.0, "saturation": 5.0, "burning": False})
+    worse = await read_hash(vitals={"health": 14.0, "food": 18.0, "saturation": 5.0, "burning": False})
+    assert hurt != worse
+
+
+async def test_a_carried_item_moving_moves_the_hash():
+    """Discrete facts are hashed exactly, not binned: one seed matters."""
+    holding = await read_hash(inventory={"usedSlots": 1, "freeSlots": 35,
+                                         "stacks": [{"name": "wheat_seeds", "count": 1}]})
+    empty = await read_hash(inventory={"usedSlots": 0, "freeSlots": 36, "stacks": []})
+    assert holding != empty
+
+
+async def test_a_new_death_moves_the_hash():
+    """A bot that just died is materially not the bot that has not."""
+    alive = await read_hash()
+    died = await read_hash(lastDeath={"observedAt": "2026-10-02T14:00:00.000Z",
+                                      "cause": "MineAI was slain by Zombie"})
+    assert alive != died
+
+
+async def test_the_last_death_is_read_from_the_situation():
+    client = FakeClient(script={"view_status": [reply_with(situation(lastDeath={
+        "observedAt": "2026-10-02T12:30:36.841Z",
+        "cause": "MineAI was slain by Zombie",
+        "dimension": "overworld",
+    }))]})
+    vector = await StateReader(client).read()
+
+    assert vector.last_death_at == "2026-10-02T12:30:36.841Z"
+    assert vector.last_death_cause == "MineAI was slain by Zombie"
+    # A world with no death yet has no lastDeath, which is not a missing section:
+    # requiring it would report an unverified world on every fresh session.
+    assert vector.unverified == []
+    assert vector.to_dict()["survival"] == {
+        "last_death_at": "2026-10-02T12:30:36.841Z",
+        "last_death_cause": "MineAI was slain by Zombie",
+    }
+
+
+def test_an_unread_field_is_not_folded_into_a_zero():
+    """Otherwise the cache serves a missing reading as though it were a real one."""
+    assert StateVector(health=None).state_hash != StateVector(health=0).state_hash
+
+
+def test_an_unverified_state_hashes_apart_from_the_same_numbers_trusted():
+    """Deciding from an unread world is a different decision and must look like one."""
+    assert (
+        StateVector(unverified=["missing section: mobility"]).state_hash
+        != StateVector().state_hash
+    )
+
+
+def test_the_hash_is_short_and_stable():
+    """Short so a ledger row stays readable; stable so a row means the same thing
+    when it is read back weeks later, which is what the Phase 3 eval needs."""
+    digest = StateVector(health=20.0).state_hash
+    assert digest == StateVector(health=20.0).state_hash
+    assert len(digest) == 16
+    assert set(digest) <= set("0123456789abcdef")

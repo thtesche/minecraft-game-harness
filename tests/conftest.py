@@ -99,6 +99,54 @@ def body_free() -> ToolReply:
     )
 
 
+def situation(**overrides: Any) -> dict[str, Any]:
+    """A complete, trustworthy situation: every section the contract promises.
+
+    Every section present and no unranked tier, so ``StateReader`` returns a
+    vector with an empty ``unverified``. Individual tests delete or corrupt the one
+    section they are about.
+    """
+    base: dict[str, Any] = {
+        "vitals": {"health": 20.0, "food": 18.0, "saturation": 5.0, "burning": False},
+        "mobility": {
+            "maximumDrop": 3,
+            "waterBuckets": 0,
+            "scaffold": {"available": False, "item": None, "blocks": 0},
+        },
+        "activity": {"owner": "idle", "activeAction": None},
+        "clock": {"timeOfDay": 6000, "phase": "day"},
+        "position": {"x": -57.551, "y": 71.0, "z": -0.632, "onGround": True, "inWater": False},
+        "inventory": {"usedSlots": 4, "freeSlots": 32,
+                      "stacks": [{"name": "dirt", "count": 10}]},
+        "tools": {
+            "tools": [{"class": "pickaxe", "tier": "wooden", "item": "wooden_pickaxe", "slot": 0,
+                       "durabilityLeft": 50, "maximumDurability": 59}],
+            "armour": [{"class": "helmet", "tier": "leather", "item": "leather_helmet", "slot": 1,
+                        "durabilityLeft": 40, "maximumDurability": 55}],
+        },
+        "nearby": {"hostiles": [], "droppedItems": []},
+        "botId": "probe",
+        "dimension": "overworld",
+        "gameMode": "survival",
+        "observedAt": "2026-10-02T13:00:00.000Z",
+    }
+    base.update(overrides)
+    return base
+
+
+def status(state: dict[str, Any] | None = None) -> ToolReply:
+    """A direct ``view_status`` reply carrying a trustworthy situation."""
+    return ToolReply(
+        is_error=False,
+        data={
+            "action": "view_status",
+            "durationMs": 1,
+            "result": {"kind": "read", "status": "succeeded", "situation": state or situation()},
+        },
+        notifications={},
+    )
+
+
 @dataclass
 class FakeClient:
     """Scripted MCP client.

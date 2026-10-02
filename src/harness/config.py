@@ -48,6 +48,17 @@ class McpConfig:
     #: kill instead of a diagnosable error.
     max_sse_event_bytes: int = 8 * 1024 * 1024
 
+    #: Prefix every ``submission_id`` this process generates.
+    #:
+    #: Not for uniqueness - ``uuid4`` already provides that. It is for
+    #: attribution: a ``SUBMISSION_CONFLICT`` names no action, so the earlier
+    #: submission that holds the id cannot be found from the refusal alone. That
+    #: refusal is unrecoverable by construction, and the only defence is making
+    #: the collision impossible to begin with. This prefix makes a conflicting id
+    #: legible in the server's own records, so an id seen twice is identifiable as
+    #: ours rather than a mystery.
+    submission_prefix: str = ""
+
     def health(self) -> str:
         return self.health_url
 
