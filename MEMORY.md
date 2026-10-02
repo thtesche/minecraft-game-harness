@@ -24,12 +24,12 @@ transcript rows):
 
 ## Current state
 
-Phase 1 slice one is **live-verified** at `35302ae`. 109 tests pass, working tree
-clean.
+Phase 1 slice one is **live-verified** at `35302ae`; the Phase 2 model decider is
+live-verified at `df7af20`. 149 tests pass, working tree clean.
 
 ```
 $ .venv/bin/python -m pytest -q
-109 passed in 3.84s
+149 passed in 4.01s
 ```
 
 Against a real Minecraft 1.21.4 host: `health` → 37 tools · `state` →
@@ -188,6 +188,9 @@ contracts. Full reasoning in `docs/harness_idea.md` §5.
 | D15 | **`SUBMISSION_CONFLICT` has no recovery, on purpose.** The refusal names no action, so the earlier submission holding that id cannot be found from it, and that work may still be running. The only defence is making the collision impossible; `mcp.submission_prefix` is for attribution, so an id seen twice is identifiable as ours. |
 | D16 | **The model decider is not gated, and records `confidence: null`.** `confidence_gate` is a Laya policy about a classifier with fitted temperatures. A frontier model asked for a JSON objective has no such number. A fixed `1.0` was proposed to unblock the loop and is refused twice over: the harness would be inventing a certainty it has no evidence for, and it would pass *any* threshold fitted in Phase 3, so the calibration mechanism would go in green reporting that calibration happened when nothing was measured. Not applying the gate gets the loop running exactly as asked, with `None` in the ledger meaning what it means. |
 | D17 | **The model chooses from the 27 tools that submit work, not all 37.** The ten reads and controls are excluded by a list declared in `llm.py`: an advertisement says nothing about being an objective, and the server's tier enums are not a ranking of these (D13). Default is *open*, so a tool the server adds later works without a change here. |
+| D18 | **`craft_item` is the decomposition engine, so the harness holds no recipe knowledge and calls no planner.** Measured: the reference run called `view_crafting_requirements` **zero** times in 388 calls. It asked for items by name and read the recipe tree, leaf materials and workstation requirement out of the `craft_item` *result* — 23 calls, 27 distinct items, 66 units. An earlier plan to call the planner once per goal is therefore dropped: it would pay for information the craft reply already carries. A goal is an **item name**, not a procedure. |
+| D19 | **A scenario is a prompt, a world, and a checker; without the third it is a demo.** The checker is written *before* the run. "It reached a wooden pickaxe" is a fact; "the run looked reasonable" is not. This is the same line `docs/harness_idea.md:152` draws for phases, applied to individual runs. |
+| D20 | **The reference run's per-call cost is not a target and its $0.240 is not comparable to ours.** Opus list price against a `cost: 0` free model compares two different things; only token counts transfer. Its 388 calls are a *ceiling*, not a target. Recorded because the temptation to quote the cheaper number is exactly what makes a baseline unreadable. |
 
 ## Laya operating limits
 
@@ -326,6 +329,41 @@ during a `run-loop` step. The mechanism is a comparison of
 `situation.lastDeath.observedAt` across a step, so a re-death is not
 double-counted.
 
+## Reference run, measured 2026-10-02
+
+Full extraction, with its validation shown, in **`docs/reference_run.md`**. Dataset
+`aibengineering/beat-the-game-minecraft`; the three files used were SHA256-verified
+against the published `SHA256SUMS`. `claude-opus-5[1m]` at effort high, zero subagents,
+fresh spawn → confirmed Ender Dragon kill.
+
+| | |
+|---|---|
+| Tool calls / turns | **388** / 389 |
+| Wall clock | 3:56:35 |
+| Cost | **$93.17** = **$0.240 per call** |
+| Cache-read input | 163,325,079 = **99.4% of all input**, 420,941 per call |
+| Context growth | 37,417 (turn 1) → 779,049 (turn 385), mean 426,246 |
+| Output / thinking | 148,383 (382 per call) / 67,071 |
+| Tools used | **34 of 37** — never called: `barter`, `send_message`, `view_crafting_requirements` |
+| `wait_for_action` | **59 calls, 15.2% of the run** |
+| Reads vs action | 44 vs 344 |
+
+**The comparison number for scenario 1: four calls from an empty inventory to a held
+wooden pickaxe**, two of them reads — `view_status`, `note_read`, `collect_block logs×16`,
+`craft_item[crafting_table, wooden_pickaxe, wooden_axe, stick×8]`. Stone tier including a
+furnace is call six.
+
+The structural claim, now with a number: the reference re-reads a growing transcript and
+pays 420,941 input tokens per call on average. Our harness reads a state vector and paid
+**16,767** prompt tokens for its one live decision — 25× fewer, and flat rather than
+compounding.
+
+Two extractions nearly produced false findings and both are recorded in the doc: a
+substring search for `"wooden_pickaxe"` reported the item was *never acquired* when it was
+acquired on call 4 (results are markdown, not JSON), and an argument map keyed by tool name
+showed every `craft_item` asking for `shears`. A check that finds nothing is not evidence of
+absence, and a check that stops running is indistinguishable from one that passes.
+
 ## Not yet verified
 
 - **Death absorption, live.** Tested against the fake only. The `lastDeath` read
@@ -350,30 +388,37 @@ Still unbuilt, part of Phase 1 per `docs/architecture.md` §2.4 and §6:
 
 ## Next move
 
-1. **Cancellation and reconnection.** The decider seam is filled — `ScriptedDecider`
+1. **Scenario 1 — reach a wooden pickaxe from nothing — plus the checker mechanism.**
+   This is the make-or-break for goal-list mode: if the model cannot sequence
+   logs → crafting table → wooden pickaxe from an unordered goal list, the rest is
+   wasted effort. Its baseline is **four calls**, of which two are reads. A scenario
+   is prompt + world + checker (D19); the checker is written first. Note D18: the
+   goal is an item name and `craft_item` does the decomposition, so there is no
+   planner call and no recipe knowledge in the harness.
+2. **Cancellation and reconnection.** The decider seam is filled — `ScriptedDecider`
    and `OpenRouterDecider` both work — so what is left of Phase 1 slice two is
    `cancel_foreground_action` and `RUNTIME_UNAVAILABLE` recovery (re-read
    `/health.foreground`, reconnect). Note the baseline's shape when judging them:
    **20–37 s per decision**, so a cancelled objective wastes real money, not just
-   time.
-2. **A longer model-backed run.** One objective has been decided live and
-   succeeded. What is unmeasured is whether the model keeps making *progress* over
-   a run — it proposed `collect_block logs` three times against an unchanged
-   state, which is correct for one step and a loop hazard for twenty. Whether that
-   is a prompting problem or the baseline simply being weak is the measurement
-   Phase 2 exists to take.
-3. **Resolve duplication against `laya-mine`** before building further — it already has a
+   time. The reference run's shape says the same thing louder: **59 of its 388 calls
+   were `wait_for_action`**, 15.2% of a $93 run spent polling.
+3. **Then: survive one night** (time-bounded, cheap, and it finally exercises **death
+   absorption live**, unverified across three sessions), and **stone tier** (both its
+   items come back `missing_materials` naming `cobbled_deepslatex`).
+4. **Resolve duplication against `laya-mine`** before building further — it already has a
    reflex dataset builder (`build_reflex_dataset.py`, 293 labelled rows in `reflex.jsonl`)
    and baseline measurements
    (`measurements/baseline-original-super120b.json`). Its rows predict *which survival
    directive the reflex should run*; the reflex is already deterministic server-side and
    needs no gating, so those rows answer a **different question** than the harness does.
    Reuse them as a baseline, or treat as a separate experiment — open question.
-4. **The remaining advertisement bloat in mine-ai-mcp** is an API decision, not a
+5. **The remaining advertisement bloat in mine-ai-mcp** is an API decision, not a
    mechanical fix: 38% of what is left is four shared definitions copied into 36 of
    37 tool schemas, and `definitions` cannot span documents. `a27d93a`'s commit
-   message carries the numbers so they need not be re-derived.
-5. **A Laya-backed decider**, when the checkpoint is available. `min_confidence`
+   message carries the numbers so they need not be re-derived. Relevant to us now that
+   it is quantified how much of a prompt is dead weight: **3 of 37 tools were never called
+   once in 388 calls**, and their schemas were in every one of those contexts.
+6. **A Laya-backed decider**, when the checkpoint is available. `min_confidence`
    still needs the Phase 3 eval before it can be set — and per D16 the gate will
    escalate every decision until it is.
 
