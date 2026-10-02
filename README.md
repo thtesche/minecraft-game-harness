@@ -5,8 +5,9 @@ A standalone application that plays Minecraft through
 [Laya](https://nandhakishorm.github.io/laya/) gating the decisions so that a frontier
 LLM is called far less often.
 
-> **Status: design complete, implementation not started.** The repository currently
-> holds the design documents only. See [Roadmap](#roadmap).
+> **Status: Phase 0 complete.** The skeleton connects, reads state, runs one objective
+> end to end, and records a ledger row. Verified against a faithful MCP stand-in rather
+> than only in unit tests — see [Running it](#running-it) and [Roadmap](#roadmap).
 
 ## The problem
 
@@ -61,17 +62,53 @@ that log is the only honest source for the baseline and for the model's own eval
 Each phase has an exit criterion, and a phase that cannot meet its criterion does not
 proceed — that is the difference between a measurement and an assumption.
 
-| Phase | Deliverable | Exit criterion |
-|---|---|---|
-| 0 — Skeleton | Connect, read status, run one objective, write a ledger row | One objective completes unattended, one ledger row exists |
-| 1 — Runner | The submit → wait → retrieve protocol state machine | A scripted multi-objective run, every row with verified evidence |
-| 2 — Baseline | LLM on every decision, on a named scenario set | A measured calls-per-objective number |
-| 3 — Eval gate | ≥ 200 labelled decisions, `laya-evals`, temperature refit | A documented planner/gatekeeper/fine-tune decision |
-| 4 — Gated loop | Laya wired in at the decision point | Fewer LLM calls per objective, success rate not regressed |
-| 5 — Fine-tune | Conditional on Phase 3 | Held-out calibration, not training-split accuracy |
+| Phase | Deliverable | Exit criterion | State |
+|---|---|---|---|
+| 0 — Skeleton | Connect, read status, run one objective, write a ledger row | One objective completes unattended, one ledger row exists | **done** |
+| 1 — Runner | The submit → wait → retrieve protocol state machine | A scripted multi-objective run, every row with verified evidence | protocol core in `objective.py`; loop not built |
+| 2 — Baseline | LLM on every decision, on a named scenario set | A measured calls-per-objective number | next |
+| 3 — Eval gate | ≥ 200 labelled decisions, `laya-evals`, temperature refit | A documented planner/gatekeeper/fine-tune decision | |
+| 4 — Gated loop | Laya wired in at the decision point | Fewer LLM calls per objective, success rate not regressed | |
+| 5 — Fine-tune | Conditional on Phase 3 | Held-out calibration, not training-split accuracy | |
 
 Phase 1 is the harness proper. Everything after it is an optimisation layer on top;
 without it there is nothing for a model to sit on.
+
+## Running it
+
+```bash
+uv venv && uv pip install -e ".[dev]"
+cp config.example.json harness.config.json   # then point mcp.url at your host
+
+harness health                              # /health plus the published tool count
+harness state                               # the derived decision vector
+harness run-one collect_block --arguments '{"block_name": "dirt"}'
+harness ledger --counts
+```
+
+Start mine-ai-mcp first; `harness health` is the check that the host is reachable.
+
+`harness state` exits non-zero when the vector is not trustworthy. That is deliberate: a
+section the contract promises but the reading did not find is reported, never replaced
+with a zero. An invented number is invisible, an escalation is not.
+
+### Tests
+
+```bash
+.venv/bin/python -m pytest
+```
+
+The protocol rules are tested twice over. Unit tests drive a scripted client, which
+proves the runner's logic. Integration tests run an actual MCP server over Streamable
+HTTP that reimplements the submission protocol from the server's contract — unique
+`submission_id`, `SUBMISSION_CONFLICT` on a changed retry, `RESULT_NOT_RETRIEVED` on an
+owed result, `pending` on an expired wait — and drive the real client against it. That
+second layer exists because the client's SDK call signature and the `structuredContent`
+envelope are exactly the kind of assumption that passes every unit test and fails at
+three in the morning against a live world.
+
+It is a stand-in for the transport and the protocol, not for Minecraft. Nothing in it
+reports a physical world outcome that a test then believes.
 
 ## A note on the numbers
 

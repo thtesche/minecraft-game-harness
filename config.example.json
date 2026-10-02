@@ -1,0 +1,31 @@
+{
+  "mcp": {
+    "url": "http://localhost:25575/mcp",
+    "health_url": "http://localhost:25575/health",
+    "tool_timeout_ms": 3600000,
+    "initial_wait_ms": 5000,
+    "poll_ms": 2000,
+    "max_polls": 900
+  },
+  "ledger": {
+    "path": "runs/ledger.jsonl",
+    "sqlite_path": "runs/ledger.sqlite"
+  },
+  "budget": {
+    "objective_ms": 900000,
+    "max_attempts_per_goal": 12,
+    "max_consecutive_failures": 3
+  },
+  "laya": {
+    "model": "laya",
+    "device": "mps",
+    "max_len": 512,
+    "head_max_len": 192,
+    "max_concurrency": 1,
+    "min_confidence": null
+  },
+  "llm": {
+    "model": "",
+    "api_key_env": "OPENROUTER_API_KEY"
+  }
+}

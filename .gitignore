@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Run artefacts. The ledger is the measurement substrate for Phase 2 and 3,
+# so it is committed deliberately when a run is being kept, and ignored while
+# a smoke test is being iterated on. Delete this line to track run data.
+runs/
+
+# Local configuration, which carries endpoint URLs and never belongs in git.
+harness.config.json
+config.local.json
