@@ -102,7 +102,7 @@ def install() -> None:
             _event_sources_built += 1
             super().__init__(
                 response,
-                max_event_size=_limit if max_event_size is None else max_event_size,
+                max_event_size=_limit,
             )
 
     _sdk.EventSource = _BoundedEventSource

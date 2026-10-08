@@ -225,7 +225,7 @@ class McpClient:
         the ceiling is too low, or the patch in :mod:`harness.sse` stopped
         applying because the SDK's call site moved.
         """
-        if "stream ended without a response" not in str(error):
+        if "stream ended without a response" not in str(error) and "Server-sent event exceeded" not in str(error):
             return error
         if not sse.require_live_patch():
             return ProtocolError(

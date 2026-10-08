@@ -6,7 +6,7 @@
     "initial_wait_ms": 5000,
     "poll_ms": 2000,
     "max_polls": 900,
-    "max_sse_event_bytes": 8388608,
+    "max_sse_event_bytes": 16777216,
     "submission_prefix": ""
   },
   "ledger": {
