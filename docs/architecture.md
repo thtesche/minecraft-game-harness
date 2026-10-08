@@ -258,21 +258,32 @@ bot 209 → 393 blocks over six runs with no way back.
 | Key | Default | Note |
 |---|---|---|
 | `mcp.url` | `http://localhost:25575/mcp` | Streamable HTTP |
+| `mcp.health_url` | `http://localhost:25575/health` | Health endpoint |
 | `mcp.tool_timeout_ms` | `3600000` | **Not optional.** A 10-minute smelt exceeds a 5-minute idle window |
-| `mcp.submission_prefix` | generated | One prefix per process run |
 | `mcp.initial_wait_ms` | `5000` | Bounded initial wait |
 | `mcp.poll_ms` | `2000` | Follow-up wait |
-| `mcp.max_polls` | budgeted | No unbounded polling |
-| `laya.model` | `laya` | English; `laya-multilingual` only if state demands it (D4) |
+| `mcp.max_polls` | `900` | No unbounded polling |
+| `mcp.max_sse_event_bytes` | `8388608` | Max SSE event size to avoid OOM |
+| `mcp.submission_prefix` | `""` | One prefix per process run for attribution |
+| `ledger.path` | `runs/ledger.jsonl` | JSONL append-only log |
+| `ledger.sqlite_path` | `runs/ledger.sqlite` | SQLite index (optional) |
+| `budget.objective_ms` | `900000` | Time budget per objective |
+| `budget.max_attempts_per_goal` | `12` | Per-goal attempts ceiling |
+| `budget.max_consecutive_failures` | `3` | Tolerate consecutive failures |
+| `budget.gate_wait_ms` | `180000` | Wait for survival reflex before giving up |
+| `laya.model` | `laya` | English checkpoint |
 | `laya.device` | `mps` | **Precondition, not an optimisation.** CPU at 88 ms is not a loop budget |
-| `laya.preload` | `true` | Otherwise a checkpoint switch costs 7–10 s |
-| `laya.max_len` | `512` | Raise only against a measured need |
-| `laya.head_max_len` | `192` | Raise only for a question that does not fit |
+| `laya.preload` | `true` | Preload checkpoint to avoid switch cost |
+| `laya.lang` | `en` | Language; `multilingual` only if state exceeds English window |
+| `laya.max_len` | `512` | Max token length for state |
+| `laya.head_max_len` | `192` | Option-prompt budget |
 | `laya.max_concurrency` | `1` | MPS aborts on concurrent forwards |
-| `laya.min_confidence` | **fitted in Phase 3** | No default until the eval exists (D3) |
-| `llm.model` | — | Frontier model, escalation only |
-| `budget.objective_ms` | set per objective | Time budget |
-| `budget.max_attempts_per_goal` | `12` | Per-goal ceiling. **Read** by `RunLoop` against the goal each objective names; a proposal past the cap stops the run as `goal_attempts_exhausted` |
+| `laya.min_confidence` | **fitted in Phase 3** | No default until eval exists (D3) |
+| `llm.model` | `""` | Frontier model, escalation only |
+| `llm.api_key_env` | `OPENROUTER_API_KEY` | Env var for API key |
+| `llm.base_url` | `https://openrouter.ai/api/v1` | OpenRouter compatible endpoint |
+| `llm.temperature` | `0.0` | Sampling temperature |
+| `run_id` | `""` | One prefix per process run (fallback to "harness") |
 
 ## 6. Build order
 
