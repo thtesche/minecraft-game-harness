@@ -338,11 +338,37 @@ def _timeout(read_s: float):
     return httpx2.Timeout(30.0, read=read_s)
 
 
+def _server_error_text(result: Any) -> str | None:
+    """The server's own reason, when a reply is an error with no structured payload.
+
+    A server-side refusal - an input validation error is the measured one:
+    ``MCP error -32602: Input validation error: ... items[0].count`` - comes
+    back as an ``is_error`` reply whose ``content`` is text blocks and whose
+    ``structured_content`` is ``None``. The text *is* the diagnosis, and
+    reporting the generic shape error instead is how a wrong model argument
+    sends the next hour of debugging towards the network.
+    """
+    if not getattr(result, "is_error", False):
+        return None
+    content = getattr(result, "content", None)
+    if not isinstance(content, (list, tuple)):
+        return None
+    texts = [
+        str(block.text).strip()
+        for block in content
+        if getattr(block, "text", None) is not None
+    ]
+    return " ".join(text for text in texts if text) or None
+
+
 def _parse_reply(tool: str, result: Any) -> ToolReply:
     # The SDK exposes `structuredContent` as `structured_content`; the payload
     # inside it is the server's own JSON and keeps its own spelling.
     structured = getattr(result, "structured_content", None)
     if not isinstance(structured, dict):
+        server_error = _server_error_text(result)
+        if server_error is not None:
+            raise UnverifiedRead(tool, server_error)
         raise UnverifiedRead(tool, "reply carried no structured content")
 
     response = structured.get("response")

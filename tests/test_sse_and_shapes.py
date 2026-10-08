@@ -212,3 +212,56 @@ def test_a_third_reply_shape_is_refused_at_parse_time():
     with pytest.raises(UnverifiedRead) as error:
         _parse_reply("view_status", Result())
     assert "neither" in str(error.value)
+
+
+def test_a_server_error_reply_names_the_server_reason():
+    """A server-side refusal (e.g. invalid arguments) must lose no cause.
+
+    The server answers an input validation error as an ``is_error`` reply with
+    the reason in text content and no ``structured_content``. Reporting "reply
+    carried no structured content" would send the diagnosis towards the network
+    instead of at the model's arguments, which is where it belongs.
+    """
+    from harness.mcp_client import _parse_reply, _server_error_text
+
+    class TextBlock:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    class Result:
+        is_error = True
+        structured_content = None
+        content = [
+            TextBlock(
+                "MCP error -32602: Input validation error: Invalid arguments for "
+                "tool craft_item: Invalid input: expected number, received string "
+                "at items[0].count"
+            )
+        ]
+
+    assert _parse_reply is not None
+    with pytest.raises(UnverifiedRead) as error:
+        _parse_reply("craft_item", Result())
+    message = str(error.value)
+    assert "items[0].count" in message
+    assert "reply carried no structured content" not in message
+    assert _server_error_text(Result()) == (
+        "MCP error -32602: Input validation error: Invalid arguments for tool "
+        "craft_item: Invalid input: expected number, received string at "
+        "items[0].count"
+    )
+
+
+def test_an_error_reply_with_no_text_keeps_the_shape_error():
+    """An is_error reply with nothing readable still says the reply had no shape."""
+    from harness.mcp_client import _parse_reply, _server_error_text
+
+    class Result:
+        is_error = True
+        structured_content = None
+        content = []
+
+    assert _server_error_text(Result()) is None
+    with pytest.raises(UnverifiedRead) as error:
+        _parse_reply("craft_item", Result())
+    assert "reply carried no structured content" in str(error.value)
