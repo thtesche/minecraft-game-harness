@@ -367,6 +367,37 @@ async def test_a_completion_names_the_goal_it_believes_is_met():
     assert claim.reason == "the furnace is crafted"
 
 
+async def test_the_goal_view_reports_what_the_bot_is_holding_right_now():
+    """The board must be read from the same state the decider is shown.
+
+    Found live: the view reported `succeeded` for an objective that had worked
+    and said nothing about the item, so a model was told `wooden_pickaxe:
+    succeeded` while the state beside it in the same message listed
+    `oak_logx2, acacia_logx1` and `best_tool: null`. It wrote "Goal already
+    succeeded" and stopped. The prompt now tells it what `done` means, but the
+    board is what it reads the meaning from, so this asserts the wiring - that
+    `achieved` comes from the vector actually sent, not from the board's own
+    history of attempts.
+    """
+    instance = decider(reply=answer(goal="wooden_pickaxe"))
+    instance.goals = GoalBoard.of(GoalSet((Goal("wooden_pickaxe"),)), max_attempts=8)
+    instance.goals.record("wooden_pickaxe", ok=True, outcome="settled:succeeded")
+
+    async def goal_sent(vector):
+        await instance.propose(vector, step=0)
+        user = instance.seen[-1]["messages"][1]["content"]     # type: ignore[attr-defined]
+        return json.loads(user)["goals"][0]
+
+    carrying_logs = await goal_sent(StateVector(carried=["oak_logx2", "acacia_logx1"]))
+    assert carrying_logs["held"] == 0
+    assert carrying_logs["achieved"] is False
+    assert carrying_logs["last_objective_succeeded"] is True, "progress is still reported, as itself"
+
+    holding_it = await goal_sent(StateVector(carried=["wooden_pickaxe"]))
+    assert holding_it["held"] == 1
+    assert holding_it["achieved"] is True
+
+
 async def test_a_goal_set_accepts_the_obvious_construction():
     """`GoalSet(("furnace",))` is what a call site naturally writes.
 

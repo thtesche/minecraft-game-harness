@@ -134,8 +134,11 @@ Rules:
 - Use only argument names and values the tool's schema allows. A misspelled \
 argument is dropped silently by the server, so the objective runs against the \
 wrong thing and reports success anyway.
-- Set "done": true when there is nothing further worth doing. Do not set it \
-merely to end the run early.
+- Set "done": true only when every goal in the list is marked \
+"achieved". A goal counts as achieved when the bot is holding that item now, \
+not when some step toward it has succeeded - gathering the logs for a \
+wooden_pickaxe is progress, not arrival. If the goal is not achieved, \
+there is always something further worth doing, so do not set "done".
 - One objective at a time. You will be called again after it completes, with \
 the state as it then is.
 - Prefer a concrete objective you can act on over a plan. If the next step is \
@@ -148,7 +151,11 @@ If a "goals" list is present, every objective must name the one goal it \
 serves in "goal", and the run is measured by calls per goal - so an objective \
 that serves no listed goal is work the run will refuse. Each goal carries how \
 many attempts it has already had; a goal marked exhausted is one the harness \
-will refuse, so work on another. A goal is a target item, not a procedure: \
+will refuse, so work on another. Each goal also carries "held" and \
+"achieved": "held" is how many of that item the bot is carrying as you read it, \
+and "achieved" is whether that meets the goal. Read those, not \
+"last_objective_succeeded" - an objective that worked is progress, not \
+arrival. A goal is a target item, not a procedure: \
 `craft_item` resolves the recipe tree itself and tells you what leaves are \
 missing, so name the item you want rather than the steps to reach it.
 
@@ -449,7 +456,7 @@ class OpenRouterDecider:
                     "role": "user",
                     "content": json.dumps({
                         "step": step,
-                        **({"goals": goals.view()} if enabled else {}),
+                        **({"goals": goals.view(vector.carried)} if enabled else {}),
                         "state": vector.to_dict(),
                         "tools": self._catalogue,
                     }, indent=2),

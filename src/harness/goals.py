@@ -210,14 +210,26 @@ class GoalBoard:
             self.successes[item] = self.successes.get(item, 0) + 1
         self.last_outcome[item] = outcome
 
-    def view(self) -> list[dict[str, Any]]:
+    def view(self, carried: Iterable[str] = ()) -> list[dict[str, Any]]:
         """The goal list as the decider is shown it.
 
         Everything here is a fact about the run. ``attempts`` and
         ``exhausted`` are included because a decider that cannot see that a goal
         is finished will keep proposing it, and a decider that cannot see that
         one is exhausted will keep rediscovering that it fails.
+
+        ``held`` and ``achieved`` were added after being measured live. This view
+        used to carry ``succeeded``, meaning *an objective for this goal
+        succeeded*, and nothing saying whether the bot holds the thing - so the
+        harness told the decider ``wooden_pickaxe: succeeded`` while it was
+        holding two oak logs and one acacia log with no pickaxe, and the decider
+        read that and stopped. Twice, identically. The field was not a lie, it
+        was the wrong question: an objective that worked is progress, not
+        arrival. ``carried`` is the loop's carry list, not the full inventory -
+        the same lossy view of the world the decider is shown everywhere else, so
+        the board cannot claim more precision than the state it reads from.
         """
+        carried = list(carried)
         return [
             {
                 "item": goal.item,
@@ -226,7 +238,11 @@ class GoalBoard:
                 "attempts": self.attempts.get(goal.item, 0),
                 "max_attempts": self.max_attempts,
                 "exhausted": self.exhausted(goal.item),
-                "succeeded": self.successes.get(goal.item, 0) > 0,
+                "held": count_carried(carried, goal.item),
+                "achieved": count_carried(carried, goal.item) >= goal.count,
+                # Named for what it is. See the docstring: `succeeded` read as
+                # "this goal is done" and was believed.
+                "last_objective_succeeded": self.successes.get(goal.item, 0) > 0,
                 "last_outcome": self.last_outcome.get(goal.item, ""),
             }
             for goal in self.goals

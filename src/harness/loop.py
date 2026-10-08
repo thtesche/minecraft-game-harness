@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .decide import Completion, Decider, Escalation, Proposal
-from .errors import BudgetExceeded, HarnessError, ObjectiveFailed
+from .errors import BudgetExceeded, HarnessError, ObjectiveFailed, UnverifiedRead
 from .goals import GoalBoard
 from .ledger import DecisionRow, Ledger
 from .objective import Objective, ObjectiveResult, ObjectiveRunner, SeenState
@@ -360,6 +360,18 @@ class RunLoop:
             # objective, and a report that counted only the successes would
             # understate the cost of the run by however many were refused.
             self._credit_abandoned(proposal.goal, entry, report, f"refused: {error}")
+            report.steps.append(entry)
+            self._emit(entry)
+            report.stop_reason = STOP_REFUSED
+            report.detail = str(error)
+            return report.stop_reason
+        except UnverifiedRead as error:
+            # The server returned something the harness cannot parse as a result.
+            # This is not a model error - the model chose a valid tool with valid
+            # arguments - but a server/harness mismatch. Record it as a refusal
+            # (the decider did answer) and stop with the reason.
+            entry.error = str(error)
+            self._credit_abandoned(proposal.goal, entry, report, f"unverified: {error}")
             report.steps.append(entry)
             self._emit(entry)
             report.stop_reason = STOP_REFUSED

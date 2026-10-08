@@ -143,11 +143,56 @@ def test_the_decider_is_shown_attempts_and_exhaustion():
     b.record("furnace", ok=False, outcome="failed:failed")
     view = {row["item"]: row for row in b.view()}
     assert view["furnace"]["attempts"] == 1
-    assert view["furnace"]["succeeded"] is False
+    assert view["furnace"]["last_objective_succeeded"] is False
     assert view["furnace"]["last_outcome"] == "failed:failed"
     assert view["furnace"]["exhausted"] is False
     assert view["shield"]["attempts"] == 0
     assert [g.item for g in b.open()] == ["furnace", "shield"]
+
+
+def test_a_successful_objective_is_not_reported_as_the_goal_being_reached():
+    """Measured live, twice, identically.
+
+    The board used to show `succeeded: true` - meaning an objective for that goal
+    worked - and nothing at all about whether the bot held the item. So on the
+    second decision of scenario 1 the harness said `wooden_pickaxe: succeeded`
+    while the state it had just sent showed `carried: ['oak_logx2',
+    'acacia_logx1']` and `best_tool: None`, and the model wrote "Goal already
+    succeeded, nothing further to do" and stopped. Not a lie in the field, the
+    wrong question in it: an objective that worked is progress, not arrival.
+    """
+    b = board(["wooden_pickaxe"], cap=8)
+    b.record("wooden_pickaxe", ok=True, outcome="settled:succeeded")
+
+    carrying_logs = b.view(["oak_logx2", "acacia_logx1"])
+    assert carrying_logs[0]["last_objective_succeeded"] is True
+    assert carrying_logs[0]["held"] == 0, "logs are not the goal item"
+    assert carrying_logs[0]["achieved"] is False
+
+    holding_it = b.view(["wooden_pickaxe"])
+    assert holding_it[0]["held"] == 1
+    assert holding_it[0]["achieved"] is True
+
+
+def test_achieved_counts_what_the_run_asked_for():
+    """A goal of 2 furnaces is not met by one, however successful the craft was."""
+    b = board([{"item": "furnace", "count": 2}], cap=8)
+    b.record("furnace", ok=True, outcome="settled:succeeded")
+    assert b.view(["furnace"])[0]["held"] == 1
+    assert b.view(["furnace"])[0]["achieved"] is False
+    assert b.view(["furnace", "furnace"])[0]["achieved"] is True
+
+
+def test_the_board_does_not_claim_more_precision_than_the_carry_list():
+    """It reads the same lossy list the decider is shown, by design (D22).
+
+    A board that reported the full inventory would let the decider see an item it
+    was never shown, and the two views of the world would disagree for reasons
+    nobody could find.
+    """
+    b = board(["wooden_pickaxe"], cap=8)
+    assert b.view([])[0]["held"] == 0
+    assert b.view(["wooden_pickaxex3"])[0]["held"] == 3, "the rendered form is parsed"
 
 
 def test_an_exhausted_goal_leaves_the_open_set():
